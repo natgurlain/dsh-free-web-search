@@ -1,0 +1,54 @@
+{
+  "name": "@natgurlain/dsh-free-web-search",
+  "version": "0.1.0",
+  "description": "Free web-search provider for DeepSeek Harness (ctx.web): Tavily keyless/free key, Brave Search API, SearXNG, and keyless Wikipedia/Hacker News fallbacks.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "web-search",
+    "search-provider",
+    "free",
+    "tavily",
+    "brave",
+    "searxng",
+    "wikipedia",
+    "hacker-news"
+  ],
+  "author": "Nat Gurlain (https://github.com/natgurlain)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/natgurlain/dsh-free-web-search.git"
+  },
+  "homepage": "https://github.com/natgurlain/dsh-free-web-search",
+  "bugs": {
+    "url": "https://github.com/natgurlain/dsh-free-web-search/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

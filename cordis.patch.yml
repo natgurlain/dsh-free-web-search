@@ -1,0 +1,18 @@
+# dsh-free-web-search bundle patch.
+#
+# Mounts the free search provider and pins the web service to it. The shipped
+# anonymous HTTP fetch backend is kept for `web_fetch`.
+#
+# A patch replaces the targeted row's whole `config`; the profile's own
+# cordis.patch.yml still applies after this bundle, so a user selection saved
+# from the Web search settings page (or a profile-level row) wins over this pin.
+
+- insert:
+    - id: free-web-search
+      name: '@natgurlain/dsh-free-web-search'
+      config: {}
+
+- id: web
+  config:
+    searchProvider: free
+    fetchProvider: http
