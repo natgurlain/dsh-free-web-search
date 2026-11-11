@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1 — 2026-11-11
+
+- Add a **DuckDuckGo** backend (`duckduckgo`): best-effort parsing of the
+  consumer HTML endpoint, with explicit detection of DuckDuckGo's HTTP 202
+  anti-bot challenge. Included after the sanctioned backends in the default
+  chain and documented as unofficial (no API, automated access not authorized).
+- Extend HTML entity decoding (named and numeric entities) for DuckDuckGo and
+  Wikipedia snippets.
+- Clarify in the README that the compliant DuckDuckGo route is SearXNG with its
+  DuckDuckGo engine enabled.
+
 ## 0.1.0 — 2026-11-11
 
 Initial release.

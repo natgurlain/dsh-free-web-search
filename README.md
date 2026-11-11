@@ -12,10 +12,11 @@ including with no API key at all.
   free Tavily API key (1,000 credits/month, no card) raises the limits.
 - **Free upgrades:** Brave Search API ($5 of free credits per month) and a
   self-hosted SearXNG instance slot into the same chain when configured.
+- **DuckDuckGo fallback:** when no sanctioned backend answers, a best-effort
+  DuckDuckGo HTML backend is tried (see the caveat below).
 - **Keyless floor:** the Wikipedia Action API and Hacker News Algolia API keep
   `web_search` returning something when every general backend is unavailable.
-- **No scraping, no dependencies:** only first-party APIs are called, and Node's
-  global `fetch` is the only network client.
+- **No dependencies:** Node's global `fetch` is the only network client.
 
 ## Requirements
 
@@ -58,7 +59,8 @@ only when no general-web backend answers.
 | ------------- | --------------------------- | ---------- | ------------- |
 | `tavily`      | Tavily Search (`api.tavily.com/search`) | none — keyless access mode; optional free key (`TAVILY_API_KEY`) for higher limits | keyless is shared and rate-limited; a free key gives 1,000 credits/month with no card |
 | `brave`       | Brave Search API (`/res/v1/web/search`) | `BRAVE_SEARCH_API_KEY` or `braveApiKey` | no free plan; each plan includes $5/month free credits ≈ 1,000 queries; a card is required to activate; no result retention and no AI training on results |
-| `searxng`     | A SearXNG instance with JSON enabled | `searxngBaseURL` | free and keyless when self-hosted; public instances usually disable JSON |
+| `searxng`     | A SearXNG instance with JSON enabled | `searxngBaseURL` | free and keyless when self-hosted; public instances usually disable JSON; can include the DuckDuckGo engine |
+| `duckduckgo`  | DuckDuckGo consumer HTML endpoint (`html.duckduckgo.com/html/`) | none | best-effort fallback; **not an official API**, automated access is not authorized and may be answered with a CAPTCHA; see below |
 | `wikipedia`   | Wikipedia Action API        | none       | keyless, encyclopedic results only |
 | `hackernews`  | Hacker News (Algolia)       | none       | keyless, tech/community results only |
 
@@ -67,7 +69,9 @@ Nothing is cached or stored by this plugin.
 ## Default behavior
 
 - With no configuration, `tavily` answers first (keyless general web search).
-- If Tavily is rate-limited or fails, `wikipedia` and `hackernews` are merged as
+- If Tavily is rate-limited or fails, the configured sanctioned backends
+  (`brave`, `searxng`) are tried, then the **DuckDuckGo HTML fallback**.
+- If all general-web backends fail, `wikipedia` and `hackernews` are merged as
   a keyless floor, and the tool result carries a note naming the failed
   general-web backend.
 - `brave` and `searxng` are skipped until their key or base URL is configured.
@@ -79,6 +83,29 @@ Nothing is cached or stored by this plugin.
 > credits/month, no credit card) and export `TAVILY_API_KEY`, or configure
 > Brave or a SearXNG instance.
 
+## DuckDuckGo caveat (read before relying on it)
+
+DuckDuckGo has **no official API that returns web results**. Its only documented
+machine endpoint is the deprecated Instant Answer API, which returns entity
+cards, not search results. The consumer HTML endpoints are not a sanctioned
+search API: DuckDuckGo's acceptable-use policy does not authorize automated
+access, and the service responds to many automated clients with an HTTP 202
+"anomaly" CAPTCHA page.
+
+This plugin includes a `duckduckgo` backend anyway because it can work from some
+networks: on 2026-11-11 the same machine received CAPTCHA pages from `curl` but
+real results from Node's `fetch` (which presents a different TLS fingerprint).
+That is inherently fragile and can break or be blocked at any time. Consequences:
+
+- The backend stays **after** the sanctioned backends in the default order.
+- A CAPTCHA or blocked response is reported as an error, so the chain falls
+  through to the keyless floor instead of hanging.
+- If you need a compliant, stable DuckDuckGo-backed path, run **SearXNG with
+  its DuckDuckGo engine enabled** and use the `searxng` backend: SearXNG owns
+  the upstream access instead of this plugin.
+- To keep the plugin to sanctioned APIs only, remove `"duckduckgo"` from
+  `backends`. You are responsible for how the endpoint is used.
+
 ## Configuration
 
 Override the plugin row from the profile's `cordis.patch.yml` (or pass the same
@@ -88,7 +115,7 @@ object as the row's `config`):
 - id: free-web-search
   name: '@natgurlain/dsh-free-web-search'
   config:
-    backends: ['tavily', 'brave', 'searxng', 'wikipedia', 'hackernews']
+    backends: ['tavily', 'brave', 'searxng', 'duckduckgo', 'wikipedia', 'hackernews']
     tavilyApiKeyEnv: TAVILY_API_KEY
     braveApiKeyEnv: BRAVE_SEARCH_API_KEY
     searxngBaseURL: http://127.0.0.1:8888
@@ -115,7 +142,9 @@ search:
 ```
 
 Public instances commonly disable JSON and answer 403, so point
-`searxngBaseURL` at an instance you control or trust.
+`searxngBaseURL` at an instance you control or trust. SearXNG's default engine
+set includes DuckDuckGo, which makes this the recommended way to get
+DuckDuckGo results without direct scraping.
 
 ## Wiring
 
@@ -138,22 +167,19 @@ search settings page (or a profile-level `web` row) wins over this pin.
 
 ## Notes and limits
 
-- **No scraping.** DuckDuckGo's HTML/lite endpoints answer automated clients
-  with a CAPTCHA and its terms do not allow this use; Mojeek, public SearXNG
-  JSON, and Marginalia block or gate automated access as well. The keyless
-  backends here are first-party APIs.
-- **Vendor fragility is expected.** Free tiers and keyless modes change; the
-  fallback chain and per-backend error messages exist so one vendor cannot
-  break the tool completely.
+- **Vendor fragility is expected.** Free tiers, keyless modes, and consumer
+  endpoints change; the fallback chain and per-backend error messages exist so
+  one vendor cannot break the tool completely.
 - **Bounded output.** Snippets are whitespace-collapsed and capped at 480
   characters before the `web_search` tool applies its own summary cap. Result
   counts are bounded per backend; the web service enforces the tool's final
   source cap.
 - **User agent.** All requests send a descriptive `User-Agent` identifying the
-  plugin.
-- **Not included:** consumer search-page scraping, You.com/Exa remote MCP
-  backends (they speak MCP rather than plain REST and can be mounted through
-  DSH's MCP client), or paid providers such as xAI Grok search.
+  plugin; the DuckDuckGo backend additionally sends a browser User-Agent because
+  the endpoint fingerprints clients.
+- **Not included:** You.com/Exa remote MCP backends (they speak MCP rather than
+  plain REST and can be mounted through DSH's MCP client), and paid providers
+  such as xAI Grok search.
 
 ## Development
 

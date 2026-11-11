@@ -8,7 +8,12 @@
  *   2. Brave Search API — no free plan, but every plan includes $5 of monthly
  *      free credits (≈1,000 queries) and needs an API key plus a card;
  *   3. a SearXNG instance that serves JSON (self-hosted; free and keyless);
- *   4. keyless Wikipedia (Action API) and Hacker News (Algolia) as a
+ *   4. DuckDuckGo's consumer HTML endpoint as a best-effort fallback. It is not
+ *      an official API, automated access is not authorized, and the endpoint
+ *      often answers with an HTTP 202 CAPTCHA; it is tried after the sanctioned
+ *      backends and reports the challenge instead of pretending it has no
+ *      results;
+ *   5. keyless Wikipedia (Action API) and Hacker News (Algolia) as a
  *      vendor-independent floor that needs no credentials at all.
  *
  * General-web backends are tried first and the first non-empty answer wins;
@@ -19,7 +24,7 @@
  * global `fetch`.
  *
  * Plugin-row configuration (every field optional):
- *   backends: ['tavily', 'brave', 'searxng', 'wikipedia', 'hackernews']
+ *   backends: ['tavily', 'brave', 'searxng', 'duckduckgo', 'wikipedia', 'hackernews']
  *   tavilyApiKey: literal Tavily key (prefer the environment variable)
  *   tavilyApiKeyEnv: environment variable holding the key (default TAVILY_API_KEY)
  *   braveApiKey: literal Brave key (prefer the environment variable)
@@ -40,10 +45,17 @@ export const PROVIDER_ID = 'free'
 
 const TAVILY_ENDPOINT = 'https://api.tavily.com/search'
 const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search'
+const DDG_ENDPOINT = 'https://html.duckduckgo.com/html/'
 const HN_ENDPOINT = 'https://hn.algolia.com/api/v1/search'
-const USER_AGENT = 'deepseek-harness-free-web-search/0.1.0'
-const DEFAULT_BACKENDS = ['tavily', 'brave', 'searxng', 'wikipedia', 'hackernews']
-const GENERAL_BACKENDS = new Set(['tavily', 'brave', 'searxng'])
+const USER_AGENT = 'deepseek-harness-free-web-search/0.1.1'
+/**
+ * Leading browser User-Agent for the DuckDuckGo HTML endpoint only. The endpoint
+ * fingerprints its clients and answers plain automation with a CAPTCHA, so this
+ * backend stays opt-in and is never a default.
+ */
+const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+const DEFAULT_BACKENDS = ['tavily', 'brave', 'searxng', 'duckduckgo', 'wikipedia', 'hackernews']
+const GENERAL_BACKENDS = new Set(['tavily', 'brave', 'searxng', 'duckduckgo'])
 const KEYLESS_BACKENDS = new Set(['wikipedia', 'hackernews'])
 const KNOWN_BACKENDS = new Set([...GENERAL_BACKENDS, ...KEYLESS_BACKENDS])
 const DEFAULT_TIMEOUT_MS = 15000
@@ -56,6 +68,7 @@ function labelOf(backend) {
 	if (backend === 'tavily') return 'Tavily'
 	if (backend === 'brave') return 'Brave Search API'
 	if (backend === 'searxng') return 'SearXNG'
+	if (backend === 'duckduckgo') return 'DuckDuckGo'
 	if (backend === 'wikipedia') return 'Wikipedia'
 	if (backend === 'hackernews') return 'Hacker News'
 	return backend
@@ -115,11 +128,29 @@ const HTML_ENTITIES = {
 	'&nbsp;': ' ',
 }
 
-/** Strip tags and decode basic entities from a Wikipedia snippet. */
-function stripHtml(text) {
+/** Decode the named and numeric HTML entities used by search-result markup. */
+function decodeEntities(text) {
 	return text
-		.replace(/<[^>]*>/gu, '')
 		.replace(/&(?:amp|quot|#39|lt|gt|nbsp);/gu, (match) => HTML_ENTITIES[match] ?? match)
+		.replace(/&#(\d+);/gu, (match, code) => {
+			try {
+				return String.fromCodePoint(Number(code))
+			} catch {
+				return match
+			}
+		})
+		.replace(/&#x([0-9a-f]+);/giu, (match, hex) => {
+			try {
+				return String.fromCodePoint(Number.parseInt(hex, 16))
+			} catch {
+				return match
+			}
+		})
+}
+
+/** Strip tags and decode entities from a search-result markup fragment. */
+function stripHtml(text) {
+	return decodeEntities(text.replace(/<[^>]*>/gu, ''))
 }
 
 /** Build the provider's options snapshot from the plugin row config. */
@@ -154,6 +185,7 @@ function isBackendUsable(backend, options) {
 	if (backend === 'tavily') return true // keyless mode always needs no credential
 	if (backend === 'brave') return options.braveApiKey.length > 0
 	if (backend === 'searxng') return isHttpUrl(options.searxngBaseURL)
+	if (backend === 'duckduckgo') return true // opt-in, best effort, no credential
 	return KEYLESS_BACKENDS.has(backend)
 }
 
@@ -365,6 +397,73 @@ async function searxngSearch(query, maxResults, options) {
 	return { sources }
 }
 
+/** Convert a DuckDuckGo result href (possibly a `/l/?uddg=` redirect) to its target URL. */
+function duckduckgoUrl(href) {
+	const resolved = href.startsWith('//') ? `https:${href}` : href
+	if (!/duckduckgo\.com\/l\//u.test(resolved)) return resolved
+	try {
+		const target = new URL(resolved).searchParams.get('uddg')
+		return target !== null && isHttpUrl(target) ? target : resolved
+	} catch {
+		return resolved
+	}
+}
+
+/** Parse a DuckDuckGo HTML result page into normalized sources (best effort). */
+function parseDuckDuckGoHtml(html) {
+	const sources = []
+	const chunks = html.split(/<div[^>]*\bclass="[^"]*\bresult\b[^"]*"[^>]*>/u).slice(1)
+	for (const chunk of chunks) {
+		const titleMatch =
+			/<a\b[^>]*\bclass="[^"]*result__a[^"]*"[^>]*\bhref="([^"]+)"[^>]*>([\s\S]*?)<\/a>/u.exec(chunk) ??
+			/<a\b[^>]*\bhref="([^"]+)"[^>]*\bclass="[^"]*result__a[^"]*"[^>]*>([\s\S]*?)<\/a>/u.exec(chunk)
+		if (titleMatch === null) continue
+		const url = duckduckgoUrl(titleMatch[1])
+		if (!isHttpUrl(url)) continue
+		const title = stripHtml(titleMatch[2]).trim()
+		const snippetMatch = /\bclass="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|div)>/u.exec(chunk)
+		const snippet = snippetMatch === null ? undefined : stripHtml(snippetMatch[1]).trim()
+		sources.push({
+			url,
+			...(title.length === 0 ? {} : { title }),
+			...(snippet === undefined || snippet.length === 0 ? {} : { snippet: clipText(snippet) }),
+		})
+	}
+	return sources
+}
+
+/**
+ * Search DuckDuckGo's consumer HTML endpoint (opt-in, best effort). The endpoint
+ * is not a sanctioned search API and usually answers automated clients with an
+ * HTTP 202 CAPTCHA, so the backend is excluded from the default chain and
+ * reports the challenge instead of pretending it has no results.
+ */
+async function duckduckgoSearch(query, maxResults, options) {
+	const form = new URLSearchParams({ q: query, kl: 'wt-wt' })
+	const response = await fetchWithTimeout(DDG_ENDPOINT, {
+		method: 'POST',
+		redirect: 'error',
+		headers: {
+			accept: 'text/html,application/xhtml+xml',
+			'content-type': 'application/x-www-form-urlencoded',
+			'user-agent': BROWSER_UA,
+		},
+		body: form.toString(),
+	}, 'DuckDuckGo', undefined, options.timeoutMs)
+	let html
+	try {
+		html = await response.text()
+	} catch {
+		throw new Error(`DuckDuckGo returned an unreadable response (HTTP ${response.status}).`)
+	}
+	if (response.status === 202 || /anomaly\.js|challenge-form|bots use DuckDuckGo/iu.test(html)) {
+		throw new Error('DuckDuckGo answered with its anti-bot challenge instead of results; direct HTML access is blocked and not authorized for automation. Use a SearXNG instance that includes the DuckDuckGo engine, or another general-web backend.')
+	}
+	if (!response.ok) throw new Error(`DuckDuckGo failed with HTTP ${response.status}.`)
+	const sources = parseDuckDuckGoHtml(html).slice(0, Math.max(maxResults, 1))
+	return { sources }
+}
+
 /** Search Wikipedia's Action API (keyless). */
 async function wikipediaSearch(query, maxResults, options) {
 	const base = `https://${options.wikipediaLanguage}.wikipedia.org`
@@ -445,6 +544,7 @@ async function searchGeneral(backend, query, maxResults, options) {
 	if (backend === 'tavily') return await tavilySearch(query, maxResults, options)
 	if (backend === 'brave') return await braveSearch(query, maxResults, options)
 	if (backend === 'searxng') return await searxngSearch(query, maxResults, options)
+	if (backend === 'duckduckgo') return await duckduckgoSearch(query, maxResults, options)
 	throw new Error(`Unknown general-web backend "${backend}".`)
 }
 
