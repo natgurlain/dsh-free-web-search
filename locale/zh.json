@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "免费网页搜索",
-    "description": "无需付费 API 的网页搜索：Brave 免费额度或 SearXNG 实例，并以无需密钥的维基百科与 Hacker News 作为回退来源。"
+    "description": "无需付费 API 的网页搜索：Tavily（免密钥或免费 API 密钥）、可选的 Brave Search 与 SearXNG、安装 Grok Build 后可搜索 X 帖子，并以无需密钥的维基百科与 Hacker News 作为回退来源。"
   }
 }

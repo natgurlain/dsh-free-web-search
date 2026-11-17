@@ -1,7 +1,7 @@
 {
   "name": "@natgurlain/dsh-free-web-search",
-  "version": "0.1.1",
-  "description": "Free web-search provider for DeepSeek Harness (ctx.web): Tavily keyless/free key, Brave Search API, SearXNG, and keyless Wikipedia/Hacker News fallbacks.",
+  "version": "0.2.0",
+  "description": "Free web-search provider for DeepSeek Harness (ctx.web): Tavily keyless/free key, Brave Search API, SearXNG, X posts through Grok Build, and keyless Wikipedia/Hacker News fallbacks.",
   "type": "module",
   "main": "./index.js",
   "exports": {
@@ -17,8 +17,19 @@
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test"
+  },
   "engines": {
     "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
   },
   "keywords": [
     "dsh",
@@ -31,7 +42,10 @@
     "brave",
     "searxng",
     "wikipedia",
-    "hacker-news"
+    "hacker-news",
+    "x",
+    "twitter",
+    "grok"
   ],
   "author": "Nat Gurlain (https://github.com/natgurlain)",
   "license": "MIT",

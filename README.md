@@ -5,27 +5,29 @@
 
 A free web-search provider for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 web capability seam (`ctx.web`). It registers the search provider id **`free`**,
-so the built-in `web_search` tool works without paying for a search API —
-including with no API key at all.
+so the built-in `web_search` tool works without paying for a search API.
 
-- **General web first:** Tavily's keyless access mode works out of the box; a
-  free Tavily API key (1,000 credits/month, no card) raises the limits.
+- **General web first:** Tavily answers out of the box in its keyless mode, and
+  reliably once you add a free Tavily API key (1,000 credits/month, no card).
 - **Free upgrades:** Brave Search API ($5 of free credits per month) and a
   self-hosted SearXNG instance slot into the same chain when configured.
-- **DuckDuckGo fallback:** when no sanctioned backend answers, a best-effort
-  DuckDuckGo HTML backend is tried (see the caveat below).
+- **X posts through Grok Build:** a query that targets X (`site:x.com`,
+  "tweets about …") is answered by the `grok` CLI's X search when Grok Build is
+  installed and signed in.
 - **Keyless floor:** the Wikipedia Action API and Hacker News Algolia API keep
   `web_search` returning something when every general backend is unavailable.
+- **Bounded and cancellable:** one search never runs past its time budget,
+  Stop interrupts it at once, a rate-limited backend is skipped until its
+  `Retry-After` passes, and a repeated query is answered from memory.
 - **No dependencies:** Node's global `fetch` is the only network client.
 
 ## Requirements
 
 - DeepSeek Harness `0.2.2-rc.1` up to (but excluding) `0.3.0`.
-- No other runtime dependencies; Node's global `fetch` supplies networking.
+- No other runtime dependencies.
+- Optional: [Grok Build](https://x.ai/cli) (`grok`), signed in, for X search.
 
 ## Install
-
-### From npm (published package)
 
 In DeepSeek Harness open **Plugins → Add plugin**, enter:
 
@@ -35,19 +37,29 @@ In DeepSeek Harness open **Plugins → Add plugin**, enter:
 
 and install. Enabling the bundle is enough: its patch inserts the provider row
 and pins the web service to it, so the model-facing `web_search` tool starts
-using it.
+using it. From a terminal the same install is:
 
-### From this repository (local checkout)
-
-Install the bundle from the package directory:
-
-```text
-pnpm install
+```bash
+dsh plugin --profile <name> add @natgurlain/dsh-free-web-search
 ```
 
-or let the plugin manager install the directory directly by passing its
-absolute path as the bundle target. Then verify the plugin row is live in
-**Plugins** and call `web_search` once in a chat.
+To install a local checkout instead, pass its path:
+
+```bash
+dsh plugin --profile <name> add /absolute/path/to/dsh-free-web-search
+```
+
+### First run: add the free Tavily key
+
+Keyless Tavily is shared evaluation traffic: it stops after roughly ten
+searches a day and then answers `429` until the next day. For everyday use,
+create a free key at [tavily.com](https://tavily.com) (1,000 credits a month,
+no credit card) and store it as `TAVILY_API_KEY` — in DeepSeek Harness's
+credential settings, or as an environment variable. The plugin reads the
+harness credential store first, so no restart is needed.
+
+Without a key the plugin still works; once the daily cap is hit, results come
+from Wikipedia and Hacker News only, and the tool result says so in one line.
 
 ## Backends
 
@@ -57,31 +69,59 @@ only when no general-web backend answers.
 
 | Backend id    | Service                     | Credential | Cost / limits |
 | ------------- | --------------------------- | ---------- | ------------- |
-| `tavily`      | Tavily Search (`api.tavily.com/search`) | none — keyless access mode; optional free key (`TAVILY_API_KEY`) for higher limits | keyless is shared and rate-limited; a free key gives 1,000 credits/month with no card |
-| `brave`       | Brave Search API (`/res/v1/web/search`) | `BRAVE_SEARCH_API_KEY` or `braveApiKey` | no free plan; each plan includes $5/month free credits ≈ 1,000 queries; a card is required to activate; no result retention and no AI training on results |
+| `x`           | X posts through Grok Build (`grok` CLI) | a signed-in Grok Build install | only used for X-targeted queries; uses your Grok plan; about 10 s per search |
+| `tavily`      | Tavily Search (`api.tavily.com/search`) | none — keyless access mode; free key (`TAVILY_API_KEY`) recommended | keyless is capped at about ten searches a day; a free key gives 1,000 credits/month with no card |
+| `brave`       | Brave Search API (`/res/v1/web/search`) | `BRAVE_SEARCH_API_KEY` or `braveApiKey` | no free plan; each plan includes $5/month free credits ≈ 1,000 queries; a card is required to activate |
 | `searxng`     | A SearXNG instance with JSON enabled | `searxngBaseURL` | free and keyless when self-hosted; public instances usually disable JSON; can include the DuckDuckGo engine |
-| `duckduckgo`  | DuckDuckGo consumer HTML endpoint (`html.duckduckgo.com/html/`) | none | best-effort fallback; **not an official API**, automated access is not authorized and may be answered with a CAPTCHA; see below |
+| `duckduckgo`  | DuckDuckGo consumer HTML endpoint (`html.duckduckgo.com/html/`) | none | best-effort fallback; **not an official API**, automated access is not authorized and is often answered with a CAPTCHA; see below |
 | `wikipedia`   | Wikipedia Action API        | none       | keyless, encyclopedic results only |
 | `hackernews`  | Hacker News (Algolia)       | none       | keyless, tech/community results only |
 
-Nothing is cached or stored by this plugin.
-
 ## Default behavior
 
-- With no configuration, `tavily` answers first (keyless general web search).
-- If Tavily is rate-limited or fails, the configured sanctioned backends
-  (`brave`, `searxng`) are tried, then the **DuckDuckGo HTML fallback**.
-- If all general-web backends fail, `wikipedia` and `hackernews` are merged as
-  a keyless floor, and the tool result carries a note naming the failed
-  general-web backend.
-- `brave` and `searxng` are skipped until their key or base URL is configured.
+- `tavily` answers first. `brave` and `searxng` are skipped until their key or
+  base URL is configured; `duckduckgo` is the last general-web attempt.
+- As soon as one general backend fails, `wikipedia` and `hackernews` start in
+  the background. Their results are used only when no general backend answers,
+  and the tool result then opens with one sentence naming what failed, for
+  example: *General web search was unavailable (Tavily keyless mode daily limit
+  reached); these results come only from Wikipedia and Hacker News.* The full
+  per-backend diagnostics go to the harness log.
+- **Rate limits:** a backend that answers `429` is not asked again until its
+  `Retry-After` has passed (one hour for a daily cap without the header, one
+  minute otherwise). A DuckDuckGo CAPTCHA pauses that backend for 15 minutes.
+- **Cache:** an answer is reused for the same query for five minutes
+  (`cacheTtlSeconds`); a fallback-only answer for one minute. The cache lives
+  in memory and is gone when the plugin reloads.
+- **Time budget:** each request gets at most `timeoutMs` (8 s), and one whole
+  search at most `totalTimeoutMs` (25 s) — below the web tool's own
+  `searchTimeoutMs` (30 s), so a stalled backend cannot get the tool call
+  killed before the fallback answers.
+- **Cancellation:** the caller's abort signal reaches every request and the
+  Grok process, so Stop and tool timeouts interrupt a search immediately.
 
-> **Observed 2026-11-11:** Tavily's keyless mode reached its
-> `daily_cap_reached` limit after a single successful search from one machine
-> (it returns `429` with a `Retry-After` header). Treat keyless as evaluation
-> traffic; for regular use, create the **free Tavily API key** (1,000
-> credits/month, no credit card) and export `TAVILY_API_KEY`, or configure
-> Brave or a SearXNG instance.
+## X search through Grok Build
+
+DeepSeek Harness has no way to search X on its own, and X has no free search
+API. If [Grok Build](https://x.ai/cli) is installed and signed in
+(`grok login`), this plugin uses it:
+
+- A query is sent to Grok only when it targets X: it contains `site:x.com` or
+  `site:twitter.com`, or mentions `x.com`, Twitter, tweets, or "on X" /
+  "X posts". Every other query skips Grok entirely.
+- The plugin runs `grok` in headless mode, in an empty temporary folder, with
+  the read-only sandbox and every tool except X search removed (no shell, no
+  files, no web, no MCP). Post text is untrusted input to that agent.
+- An answer is accepted only if the run really called an X search tool, and
+  only `x.com/<handle>/status/<id>` URLs are kept, so posts answered from the
+  model's memory are discarded rather than cited.
+- If Grok is missing, signed out, slow, or finds nothing, the normal chain
+  answers and the result says the posts are general web results, not X posts.
+
+The search uses your Grok account and plan. `grok` is looked up on `PATH`, then
+in `~/.local/bin`, `~/.grok/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`
+(a desktop app does not inherit your shell's `PATH`); set `grokPath` if it
+lives elsewhere. Remove `x` from `backends` to turn the feature off.
 
 ## DuckDuckGo caveat (read before relying on it)
 
@@ -92,43 +132,64 @@ search API: DuckDuckGo's acceptable-use policy does not authorize automated
 access, and the service responds to many automated clients with an HTTP 202
 "anomaly" CAPTCHA page.
 
-This plugin includes a `duckduckgo` backend anyway because it can work from some
-networks: on 2026-11-11 the same machine received CAPTCHA pages from `curl` but
-real results from Node's `fetch` (which presents a different TLS fingerprint).
-That is inherently fragile and can break or be blocked at any time. Consequences:
+The `duckduckgo` backend is in the default chain anyway, as the last
+general-web attempt, because it works from some networks. It is fragile: which
+clients get the CAPTCHA changes over time and by network (on 2026-11-11 Node's
+`fetch` got results where `curl` did not; on 2026-11-17 it was the reverse).
+Consequences:
 
 - The backend stays **after** the sanctioned backends in the default order.
-- A CAPTCHA or blocked response is reported as an error, so the chain falls
-  through to the keyless floor instead of hanging.
+- A CAPTCHA is reported as an error and the backend is paused for 15 minutes,
+  so a blocked network pays for one failed request, not one per search.
 - If you need a compliant, stable DuckDuckGo-backed path, run **SearXNG with
-  its DuckDuckGo engine enabled** and use the `searxng` backend: SearXNG owns
-  the upstream access instead of this plugin.
+  its DuckDuckGo engine enabled** and use the `searxng` backend.
 - To keep the plugin to sanctioned APIs only, remove `"duckduckgo"` from
   `backends`. You are responsible for how the endpoint is used.
 
 ## Configuration
 
-Override the plugin row from the profile's `cordis.patch.yml` (or pass the same
-object as the row's `config`):
+The plugin exports a configuration schema, so the fields below are validated
+when the plugin loads (a wrong type or an unknown backend id fails the load
+with a message) and appear in the plugin's settings form, with API keys
+masked. To set them by hand, override the plugin row in the profile's
+`cordis.patch.yml`:
 
 ```yaml
 - id: free-web-search
   name: '@natgurlain/dsh-free-web-search'
   config:
-    backends: ['tavily', 'brave', 'searxng', 'duckduckgo', 'wikipedia', 'hackernews']
+    backends: ['x', 'tavily', 'brave', 'searxng', 'duckduckgo', 'wikipedia', 'hackernews']
     tavilyApiKeyEnv: TAVILY_API_KEY
     braveApiKeyEnv: BRAVE_SEARCH_API_KEY
     searxngBaseURL: http://127.0.0.1:8888
     wikipediaLanguage: en
-    timeoutMs: 15000
+    timeoutMs: 8000
+    totalTimeoutMs: 25000
+    cacheTtlSeconds: 300
 ```
 
-All fields are optional. `tavilyApiKey` and `braveApiKey` also accept a literal
-key, but prefer the environment variables so no secret enters configuration.
+| Field | Default | Meaning |
+| ----- | ------- | ------- |
+| `backends` | all seven, in the order above | Which backends to use and in what order |
+| `tavilyApiKeyEnv` | `TAVILY_API_KEY` | Credential reference holding the Tavily key |
+| `tavilyApiKey` | (unset) | Literal Tavily key; prefer the reference so no secret enters configuration |
+| `braveApiKeyEnv` | `BRAVE_SEARCH_API_KEY` | Credential reference holding the Brave key |
+| `braveApiKey` | (unset) | Literal Brave key; prefer the reference |
+| `searxngBaseURL` | (unset) | Base URL of a SearXNG instance with JSON enabled |
+| `wikipediaLanguage` | `en` | Wikipedia language edition |
+| `timeoutMs` | `8000` | Upper bound for one request |
+| `totalTimeoutMs` | `25000` | Upper bound for one whole search; keep it below the web tool's `searchTimeoutMs` |
+| `cacheTtlSeconds` | `300` | How long an answer is reused for the same query; `0` disables the cache |
+| `grokPath` | (found automatically) | Path of the Grok Build CLI |
+| `grokModel` | (Grok Build's default) | Grok model used for X searches |
+| `xTimeoutMs` | `20000` | Upper bound for one X search |
+
+Keys are resolved for every search: first the literal value, then the harness
+credential store (which also covers environment variables and `.env` files),
+then the process environment.
 
 To use `brave` first, move it before `tavily` in `backends`. To disable a
-backend, remove it from the list; an empty list makes the provider unavailable
-and `web_search` reports a configuration error.
+backend, remove it from the list; an empty list makes the provider unavailable.
 
 ### SearXNG setup
 
@@ -162,8 +223,9 @@ DuckDuckGo results without direct scraping.
 ```
 
 The profile layer applies after this bundle, so a selection saved from the Web
-search settings page (or a profile-level `web` row) wins over this pin.
-`web_fetch` keeps using the shipped anonymous HTTP fetch provider.
+search settings page (or a profile-level `web` row) wins over this pin. In that
+page the provider is listed as **Free web search**. `web_fetch` keeps using the
+shipped anonymous HTTP fetch provider, whose id is `http`.
 
 ## Notes and limits
 
@@ -171,21 +233,25 @@ search settings page (or a profile-level `web` row) wins over this pin.
   endpoints change; the fallback chain and per-backend error messages exist so
   one vendor cannot break the tool completely.
 - **Bounded output.** Snippets are whitespace-collapsed and capped at 480
-  characters before the `web_search` tool applies its own summary cap. Result
-  counts are bounded per backend; the web service enforces the tool's final
-  source cap.
+  characters. Results are de-duplicated by URL, ignoring tracking parameters
+  such as `utm_source`. The web service enforces the tool's final source cap.
 - **User agent.** All requests send a descriptive `User-Agent` identifying the
-  plugin; the DuckDuckGo backend additionally sends a browser User-Agent because
-  the endpoint fingerprints clients.
+  plugin; the DuckDuckGo backend sends a browser User-Agent instead because
+  the endpoint answers anything else with a CAPTCHA.
 - **Not included:** You.com/Exa remote MCP backends (they speak MCP rather than
-  plain REST and can be mounted through DSH's MCP client), and paid providers
-  such as xAI Grok search.
+  plain REST and can be mounted through DSH's MCP client).
 
 ## Development
 
-There is no build step; the package ships plain ESM.
+There is no build step and nothing to install; the package ships plain ESM.
 
-- Validate the module and run one live search with Node:
+- Run the tests (they mock the network and Grok Build):
+
+  ```bash
+  npm test
+  ```
+
+- Run one live search with Node:
 
   ```bash
   node --input-type=module -e "
@@ -196,9 +262,6 @@ There is no build step; the package ships plain ESM.
   "
   ```
 
-- Install the directory into a profile with the plugin manager's bundle
-  installation, then confirm the row with the live config inspection and one
-  `web_search` call.
 - License and publication: MIT, published as
   `@natgurlain/dsh-free-web-search`.
 
