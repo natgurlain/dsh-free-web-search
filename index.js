@@ -14,8 +14,17 @@
  *      access is not authorized, and it answers plain HTTP clients with an
  *      anti-bot challenge; when enabled it reports the challenge instead of
  *      pretending it has no results, and is then skipped for a while;
- *   5. keyless Wikipedia (Action API) and Hacker News (Algolia) as a
+ *   5. Exa and You.com through their hosted keyless endpoints (no account;
+ *      Exa has an unpublished free rate limit, You.com allows 100 searches a
+ *      day), so a spent Tavily keyless allowance still leaves real web results;
+ *   6. keyless Wikipedia (Action API) and Hacker News (Algolia) as a
  *      vendor-independent floor that needs no credentials at all.
+ *
+ * Specialised sources run beside that chain, but only for queries routed to
+ * them (see `verticalsOf`): Stack Overflow for a query that quotes an error
+ * message or names Stack Overflow, GitHub repository search for a query that
+ * names GitHub or asks for a repository, and (opt-in) arXiv for paper queries.
+ * Their top results lead the answer, each marked with its source type.
  *
  * Queries that target X (`site:x.com`, `site:twitter.com`, "tweets", "on X")
  * are first answered through Grok Build (the `grok` CLI) when it is installed
@@ -56,6 +65,11 @@ const TAVILY_ENDPOINT = 'https://api.tavily.com/search'
 const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search'
 const DDG_ENDPOINT = 'https://html.duckduckgo.com/html/'
 const HN_ENDPOINT = 'https://hn.algolia.com/api/v1/search'
+const EXA_ENDPOINT = 'https://mcp.exa.ai/mcp'
+const YOU_ENDPOINT = 'https://api.you.com/mcp?profile=free'
+const STACKEXCHANGE_ENDPOINT = 'https://api.stackexchange.com/2.3/search/advanced'
+const GITHUB_API = 'https://api.github.com'
+const ARXIV_ENDPOINT = 'https://export.arxiv.org/api/query'
 const USER_AGENT = `deepseek-harness-free-web-search/${VERSION}`
 /**
  * Browser User-Agent for the DuckDuckGo HTML endpoint only: it answers a
@@ -63,10 +77,16 @@ const USER_AGENT = `deepseek-harness-free-web-search/${VERSION}`
  * opt-in: add `duckduckgo` to `backends` to try it.
  */
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-const DEFAULT_BACKENDS = ['x', 'tavily', 'brave', 'searxng', 'wikipedia', 'hackernews']
-const GENERAL_BACKENDS = new Set(['tavily', 'brave', 'searxng', 'duckduckgo'])
+const DEFAULT_BACKENDS = [
+	'x', 'tavily', 'brave', 'searxng', 'exa', 'you',
+	'stackexchange', 'github',
+	'wikipedia', 'hackernews',
+]
+const GENERAL_BACKENDS = new Set(['tavily', 'brave', 'searxng', 'exa', 'you', 'duckduckgo'])
+/** Specialised sources, asked only when the query is routed to them (see `verticalsOf`). */
+const VERTICAL_BACKENDS = new Set(['stackexchange', 'github', 'arxiv'])
 const KEYLESS_BACKENDS = new Set(['wikipedia', 'hackernews'])
-const KNOWN_BACKENDS = new Set(['x', ...GENERAL_BACKENDS, ...KEYLESS_BACKENDS])
+const KNOWN_BACKENDS = new Set(['x', ...GENERAL_BACKENDS, ...VERTICAL_BACKENDS, ...KEYLESS_BACKENDS])
 const DEFAULT_TAVILY_ENV = 'TAVILY_API_KEY'
 const DEFAULT_BRAVE_ENV = 'BRAVE_SEARCH_API_KEY'
 const DEFAULT_TIMEOUT_MS = 8000
@@ -80,6 +100,13 @@ const ERROR_MAX_CHARS = 240
 const MIN_REQUEST_MS = 300
 /** Time kept back from the X search so the general chain can still answer. */
 const X_RESERVE_MS = 6000
+/** Upper bound for one specialised-source request, so it never holds back a general answer for long. */
+const VERTICAL_TIMEOUT_MS = 5000
+/** Results one specialised source is asked for, and how many of them lead a general answer. */
+const VERTICAL_LIMIT = 3
+const VERTICAL_SLOTS = 3
+/** How long a finished general answer waits for specialised sources still running. */
+const VERTICAL_GRACE_MS = 1500
 const CACHE_MAX_ENTRIES = 100
 /** How long a fallback-only (Wikipedia/Hacker News) answer may be reused. */
 const FLOOR_CACHE_TTL_MS = 60_000
@@ -135,6 +162,11 @@ function labelOf(backend) {
 	if (backend === 'brave') return 'Brave Search API'
 	if (backend === 'searxng') return 'SearXNG'
 	if (backend === 'duckduckgo') return 'DuckDuckGo'
+	if (backend === 'exa') return 'Exa'
+	if (backend === 'you') return 'You.com'
+	if (backend === 'stackexchange') return 'Stack Overflow'
+	if (backend === 'github') return 'GitHub'
+	if (backend === 'arxiv') return 'arXiv'
 	if (backend === 'wikipedia') return 'Wikipedia'
 	if (backend === 'hackernews') return 'Hacker News'
 	return backend
@@ -405,6 +437,11 @@ async function rateLimitError(response, label, hint) {
 		`${label} ${dailyCap ? 'daily limit reached' : 'rate-limited'}`,
 		wait,
 	)
+}
+
+/** "A", "A and B", or "A, B and C". */
+function listOf(names) {
+	return names.length <= 2 ? names.join(' and ') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`
 }
 
 /** Interleave result groups rank-by-rank so merged sources stay balanced. */
@@ -730,6 +767,334 @@ async function hackernewsSearch(query, maxResults, options, signal, timeoutMs) {
 	})
 }
 
+/** The JSON-RPC reply inside an MCP HTTP response body (plain JSON or an event stream). */
+function parseMcpReply(raw) {
+	const candidates = raw.trimStart().startsWith('{')
+		? [raw]
+		: raw.split(/\r?\n/u).filter((line) => line.startsWith('data:')).map((line) => line.slice(5))
+	for (const candidate of candidates) {
+		try {
+			const message = JSON.parse(candidate)
+			if (message !== null && typeof message === 'object' && (message.result !== undefined || message.error !== undefined)) return message
+		} catch {
+			// Not a complete JSON event; keep looking.
+		}
+	}
+	return undefined
+}
+
+/**
+ * Call one tool on a hosted, keyless MCP endpoint with a single stateless
+ * `tools/call` request and return the text of its answer.
+ */
+async function mcpToolText(endpoint, tool, args, label, signal, timeoutMs) {
+	return await exchange(endpoint, {
+		method: 'POST',
+		redirect: 'error',
+		headers: {
+			accept: 'application/json, text/event-stream',
+			'content-type': 'application/json',
+			'user-agent': USER_AGENT,
+		},
+		body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: tool, arguments: args } }),
+	}, label, signal, timeoutMs, async (response) => {
+		if (response.status === 429) throw await rateLimitError(response, label)
+		if (response.status === 401 || response.status === 403) {
+			const detail = await errorDetail(response)
+			throw new BackendError(
+				`${label} refused the keyless request (HTTP ${response.status})${detail === undefined ? '' : `: ${detail}`}; it is skipped for ${formatSpan(COOLDOWN_CHALLENGE_MS)}.`,
+				`${label} keyless access refused`,
+				COOLDOWN_CHALLENGE_MS,
+			)
+		}
+		if (!response.ok) {
+			const detail = await errorDetail(response)
+			throw new BackendError(`${label} failed with HTTP ${response.status}${detail === undefined ? '' : `: ${detail}`}.`, `${label} failed`)
+		}
+		const reply = parseMcpReply(await response.text())
+		if (reply === undefined) throw new BackendError(`${label} returned a response without a tool result.`, `${label} failed`)
+		const parts = Array.isArray(reply.result?.content) ? reply.result.content : []
+		const text = parts.filter((part) => part?.type === 'text' && typeof part.text === 'string').map((part) => part.text).join('\n')
+		const failure = reply.error !== undefined
+			? nonEmpty(reply.error?.message) ?? 'unknown error'
+			: reply.result?.isError === true ? (nonEmpty(text) ?? 'unknown error') : undefined
+		if (failure !== undefined) {
+			const limited = /rate.?limit|quota|too many|limit (?:reached|exceeded)/iu.test(failure)
+			throw new BackendError(
+				`${label} answered with an error: ${clipError(failure)}`.replace(/\.*$/u, '.'),
+				limited ? `${label} rate-limited` : `${label} failed`,
+				limited ? COOLDOWN_DAILY_CAP_MS : undefined,
+			)
+		}
+		return text
+	})
+}
+
+/** A timestamp string when it parses as a date, else `undefined`. */
+function validDate(value) {
+	const text = nonEmpty(value)
+	return text !== undefined && !Number.isNaN(Date.parse(text)) ? text : undefined
+}
+
+/** Parse Exa's text answer (`Title:` / `URL:` / `Published:` / `Highlights:` blocks) into sources. */
+function parseExaText(text) {
+	const sources = []
+	for (const block of text.split(/^(?=Title: .*\r?\nURL: )/mu)) {
+		const url = /^URL: (\S+)/mu.exec(block)?.[1]
+		if (url === undefined || !isHttpUrl(url)) continue
+		const title = nonEmpty(/^Title: (.*)$/mu.exec(block)?.[1])
+		const publishedAt = validDate(/^Published: (.*)$/mu.exec(block)?.[1])
+		const body = block.split(/^(?:Highlights|Text|Summary):[ \t]*$/mu)[1]
+		const snippet = body === undefined ? undefined : nonEmpty(body.replace(/\s+/gu, ' '))
+		sources.push({
+			url,
+			...(title === undefined ? {} : { title }),
+			...(snippet === undefined ? {} : { snippet: clipText(snippet) }),
+			...(publishedAt === undefined ? {} : { publishedAt }),
+		})
+	}
+	return sources
+}
+
+/** Search through Exa's hosted MCP endpoint (keyless; free rate limit, IPv4 only). */
+async function exaSearch(query, maxResults, options, signal, timeoutMs) {
+	const text = await mcpToolText(EXA_ENDPOINT, 'web_search_exa', {
+		query,
+		numResults: Math.min(Math.max(maxResults, 1), 10),
+		objective: `Find the pages that best answer this search query: ${clipText(query, 300)}`,
+	}, 'Exa', signal, timeoutMs)
+	return { sources: parseExaText(text).slice(0, Math.max(maxResults, 1)) }
+}
+
+/** Search through You.com's hosted MCP endpoint, free profile (keyless; 100 searches a day). */
+async function youSearch(query, maxResults, options, signal, timeoutMs) {
+	const text = await mcpToolText(YOU_ENDPOINT, 'you-search', {
+		query: query.length > 400 ? query.slice(0, 400) : query,
+		count: Math.min(Math.max(maxResults, 1), 20),
+	}, 'You.com', signal, timeoutMs)
+	let body
+	try {
+		body = JSON.parse(text)
+	} catch {
+		throw new BackendError('You.com returned a search answer that is not JSON.', 'You.com failed')
+	}
+	const items = [
+		...(Array.isArray(body?.results?.web) ? body.results.web : []),
+		...(Array.isArray(body?.results?.news) ? body.results.news : []),
+	]
+	const sources = []
+	for (const item of items) {
+		const url = nonEmpty(item?.url)
+		if (url === undefined || !isHttpUrl(url)) continue
+		const title = nonEmpty(item?.title)
+		const highlights = Array.isArray(item?.contents?.highlights) ? item.contents.highlights : []
+		const snippet = nonEmpty(item?.description) ?? nonEmpty(highlights.find((entry) => typeof entry === 'string'))
+		const publishedAt = validDate(item?.page_age)
+		sources.push({
+			url,
+			...(title === undefined ? {} : { title }),
+			...(snippet === undefined ? {} : { snippet: clipText(snippet.replace(/\s+/gu, ' ')) }),
+			...(publishedAt === undefined ? {} : { publishedAt }),
+		})
+	}
+	return { sources: sources.slice(0, Math.max(maxResults, 1)) }
+}
+
+/** Signs that a query quotes an error message or a stack trace. */
+const ERROR_QUERY = /\b[A-Z][A-Za-z]*(?:Error|Exception)\b|\bTraceback\b|\bE(?:CONN|NOENT|NOTFOUND|ACCES|PERM|ADDR|PIPE|TIMEDOUT|EXIST|MFILE|INVAL|RR_)[A-Z_]*\b|\berror\s+(?:TS|CS|E|C)\d{3,}\b|\b(?:segfault|segmentation fault|stack trace|panicked at|undefined reference)\b|\b(?:cannot|can't) (?:read propert|find module|resolve module)|\bis not (?:a function|defined)\b/u
+
+/** Specialised sources: what selects each one and which words are dropped from its query. */
+const VERTICAL_ROUTES = [
+	{
+		backend: 'stackexchange',
+		match: (query) => /\bstack ?(?:overflow|exchange)\b/iu.test(query) || ERROR_QUERY.test(query),
+		strip: /\b(?:on |from |site:\S*)?stack ?(?:overflow|exchange)(?:\.com)?\b/giu,
+	},
+	{
+		backend: 'github',
+		match: (query) => /\bgithub\b|\brepo(?:s|sitory|sitories)?\b|\bopen[- ]source (?:librar(?:y|ies)|projects?|implementations?|tools?|alternatives?)\b/iu.test(query),
+		strip: /\b(?:on |from |site:\S*)?github(?:\.com)?\b|\brepo(?:s|sitory|sitories)?\b|\bopen[- ]source\b/giu,
+	},
+	{
+		backend: 'arxiv',
+		match: (query) => /\barxiv\b|\bpreprints?\b|\bet al\b|\b(?:research|scientific|academic|survey) papers?\b|\bpapers? (?:on|about)\b/iu.test(query),
+		strip: /\b(?:on |from |site:\S*)?arxiv(?:\.org)?\b|\bpreprints?\b|\b(?:research|scientific|academic) papers?\b|\bpapers? (?:on|about)\b/giu,
+	},
+]
+
+/**
+ * The specialised sources one query should also be sent to, each with the
+ * query to send. Matching is deliberately narrow: a query that names no source
+ * and quotes no error message selects none.
+ */
+export function verticalsOf(query) {
+	const selected = []
+	for (const route of VERTICAL_ROUTES) {
+		if (!route.match(query)) continue
+		const stripped = route.strip === undefined ? query : query.replace(route.strip, ' ')
+		const cleaned = stripped.replace(/(?:^|\s)site:\S+/giu, ' ').replace(/\s+/gu, ' ').trim()
+		selected.push({
+			backend: route.backend,
+			query: cleaned.length >= 2 ? cleaned : query.trim(),
+		})
+	}
+	return selected
+}
+
+/** Join the present parts of a source-type line. */
+function tagLine(parts) {
+	return parts.filter((part) => part !== undefined && part !== '').join(' · ')
+}
+
+/** A snippet made of a source-type line and an optional body, within the snippet limit. */
+function taggedSnippet(tag, body) {
+	const text = nonEmpty(typeof body === 'string' ? body.replace(/\s+/gu, ' ') : undefined)
+	return text === undefined ? tag : `${tag} — ${clipText(text, Math.max(SNIPPET_MAX_CHARS - tag.length - 3, 80))}`
+}
+
+/** Search Stack Overflow questions through the Stack Exchange API (keyless; 300 requests a day per address). */
+async function stackexchangeSearch(query, limit, signal, timeoutMs) {
+	const url = new URL(STACKEXCHANGE_ENDPOINT)
+	url.searchParams.set('q', clipText(query, 200))
+	url.searchParams.set('site', 'stackoverflow')
+	url.searchParams.set('order', 'desc')
+	url.searchParams.set('sort', 'relevance')
+	url.searchParams.set('answers', '1')
+	url.searchParams.set('pagesize', String(limit * 2))
+	return await exchange(url, {
+		method: 'GET',
+		redirect: 'error',
+		headers: { accept: 'application/json', 'user-agent': USER_AGENT },
+	}, 'Stack Overflow', signal, timeoutMs, async (response) => {
+		if (response.status === 429) throw await rateLimitError(response, 'Stack Overflow')
+		const body = await readJsonResponse(response, 'Stack Overflow')
+		if (!response.ok || body?.error_id !== undefined) {
+			const throttled = /throttle/iu.test(String(body?.error_name ?? ''))
+			throw new BackendError(
+				`Stack Overflow search failed (HTTP ${response.status}${nonEmpty(body?.error_message) === undefined ? '' : `: ${clipError(body.error_message)}`}).`,
+				throttled ? 'Stack Overflow rate-limited' : 'Stack Overflow failed',
+				throttled ? COOLDOWN_DAILY_CAP_MS : undefined,
+			)
+		}
+		// The API asks clients to pause when it sends `backoff` (seconds) or when the daily quota is spent.
+		if (Number.isFinite(body?.backoff) && body.backoff > 0) {
+			cooldowns.set('stackexchange', { until: Date.now() + body.backoff * 1000, brief: 'Stack Overflow asked for a pause' })
+		} else if (body?.quota_remaining === 0) {
+			cooldowns.set('stackexchange', { until: Date.now() + COOLDOWN_DAILY_CAP_MS, brief: 'Stack Overflow daily limit reached' })
+		}
+		const sources = []
+		for (const item of Array.isArray(body?.items) ? body.items : []) {
+			const link = nonEmpty(item?.link)
+			const title = nonEmpty(item?.title)
+			if (link === undefined || title === undefined || !isHttpUrl(link)) continue
+			if (Number.isFinite(item?.score) && item.score < 0) continue
+			const tags = Array.isArray(item?.tags) ? item.tags.filter((tag) => typeof tag === 'string').slice(0, 5).join(', ') : ''
+			sources.push({
+				url: link,
+				title: decodeEntities(title),
+				snippet: tagLine([
+					'Stack Overflow question',
+					item?.is_answered === true ? 'answered' : undefined,
+					Number.isFinite(item?.score) ? `score ${item.score}` : undefined,
+					Number.isFinite(item?.answer_count) ? `${item.answer_count} answers` : undefined,
+					tags.length > 0 ? `tags: ${tags}` : undefined,
+				]),
+				...(Number.isFinite(item?.creation_date) ? { publishedAt: new Date(item.creation_date * 1000).toISOString() } : {}),
+			})
+		}
+		return { sources: sources.slice(0, limit) }
+	})
+}
+
+/** Search GitHub repositories through the REST API (keyless; 10 searches a minute per address). */
+async function githubSearch(query, limit, signal, timeoutMs) {
+	const url = new URL(`${GITHUB_API}/search/repositories`)
+	url.searchParams.set('q', clipText(query, 200))
+	url.searchParams.set('per_page', String(limit))
+	return await exchange(url, {
+		method: 'GET',
+		redirect: 'error',
+		headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': USER_AGENT },
+	}, 'GitHub', signal, timeoutMs, async (response) => {
+		if (response.status === 429 || (response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0')) {
+			const reset = Number(response.headers.get('x-ratelimit-reset'))
+			const wait = Math.min(COOLDOWN_MAX_MS, Math.max(5000, retryAfterMs(response) ?? (Number.isFinite(reset) && reset > 0 ? reset * 1000 - Date.now() : COOLDOWN_DEFAULT_MS)))
+			throw new BackendError(`GitHub search rate limit reached (HTTP ${response.status}); it is skipped for ${formatSpan(wait)}.`, 'GitHub rate-limited', wait)
+		}
+		if (!response.ok) {
+			const detail = await errorDetail(response)
+			throw new BackendError(`GitHub search failed with HTTP ${response.status}${detail === undefined ? '' : `: ${detail}`}.`, 'GitHub failed')
+		}
+		const body = await readJsonResponse(response, 'GitHub')
+		const sources = []
+		for (const item of Array.isArray(body?.items) ? body.items : []) {
+			const link = nonEmpty(item?.html_url)
+			const fullName = nonEmpty(item?.full_name)
+			if (link === undefined || fullName === undefined || !isHttpUrl(link)) continue
+			sources.push({
+				url: link,
+				title: fullName,
+				snippet: taggedSnippet(tagLine([
+					'GitHub repository',
+					Number.isFinite(item?.stargazers_count) ? `${item.stargazers_count} stars` : undefined,
+					nonEmpty(item?.language),
+					item?.archived === true ? 'archived' : undefined,
+				]), item?.description),
+				...(validDate(item?.pushed_at) === undefined ? {} : { publishedAt: item.pushed_at }),
+			})
+		}
+		return { sources }
+	})
+}
+
+/** Words that carry no meaning in an arXiv term query. */
+const ARXIV_STOPWORDS = new Set(['a', 'an', 'the', 'of', 'on', 'in', 'for', 'and', 'or', 'to', 'with', 'about', 'by', 'from', 'is', 'are', 'what', 'how', 'paper', 'papers', 'latest', 'recent', 'new'])
+
+/** Search arXiv through its Atom API (keyless; the service asks for sparing use, which the cache provides). */
+async function arxivSearch(query, limit, signal, timeoutMs) {
+	const words = (query.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}-]*/gu) ?? []).filter((word) => word.length > 1 && !ARXIV_STOPWORDS.has(word)).slice(0, 8)
+	if (words.length === 0) return { sources: [] }
+	const url = new URL(ARXIV_ENDPOINT)
+	url.searchParams.set('search_query', words.map((word) => `all:${word}`).join(' AND '))
+	url.searchParams.set('start', '0')
+	url.searchParams.set('max_results', String(limit))
+	url.searchParams.set('sortBy', 'relevance')
+	return await exchange(url, {
+		method: 'GET',
+		redirect: 'follow',
+		headers: { accept: 'application/atom+xml', 'user-agent': USER_AGENT },
+	}, 'arXiv', signal, timeoutMs, async (response) => {
+		if (response.status === 429) throw await rateLimitError(response, 'arXiv')
+		if (!response.ok) throw new BackendError(`arXiv API failed with HTTP ${response.status}.`, 'arXiv failed')
+		const xml = await response.text()
+		const sources = []
+		for (const entry of xml.split(/<entry>/u).slice(1)) {
+			const pick = (tag) => decodeEntities((new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'u').exec(entry)?.[1] ?? '').replace(/\s+/gu, ' ').trim())
+			const id = pick('id').replace(/^http:/u, 'https:')
+			const title = pick('title')
+			if (!isHttpUrl(id) || title.length === 0) continue
+			const authors = [...entry.matchAll(/<name>([\s\S]*?)<\/name>/gu)].map((match) => decodeEntities(match[1].trim()))
+			const byline = authors.length === 0 ? undefined : authors.length > 3 ? `${authors.slice(0, 3).join(', ')} et al.` : authors.join(', ')
+			const published = validDate(pick('published'))
+			sources.push({
+				url: id,
+				title,
+				snippet: taggedSnippet(tagLine(['arXiv paper', byline]), pick('summary')),
+				...(published === undefined ? {} : { publishedAt: published }),
+			})
+		}
+		return { sources }
+	})
+}
+
+/** Dispatch one specialised source. */
+async function searchVertical(route, limit, signal, timeoutMs) {
+	if (route.backend === 'stackexchange') return await stackexchangeSearch(route.query, limit, signal, timeoutMs)
+	if (route.backend === 'github') return await githubSearch(route.query, limit, signal, timeoutMs)
+	if (route.backend === 'arxiv') return await arxivSearch(route.query, limit, signal, timeoutMs)
+	throw new Error(`Unknown specialised source "${route.backend}".`)
+}
+
 /**
  * The part of a query to search X for, or `undefined` when the query does not
  * target X. `site:x.com` / `site:twitter.com` operators are removed; a query
@@ -975,6 +1340,8 @@ async function searchGeneral(backend, query, maxResults, options, signal, timeou
 	if (backend === 'tavily') return await tavilySearch(query, maxResults, options, signal, timeoutMs)
 	if (backend === 'brave') return await braveSearch(query, maxResults, options, signal, timeoutMs)
 	if (backend === 'searxng') return await searxngSearch(query, maxResults, options, signal, timeoutMs)
+	if (backend === 'exa') return await exaSearch(query, maxResults, options, signal, timeoutMs)
+	if (backend === 'you') return await youSearch(query, maxResults, options, signal, timeoutMs)
 	if (backend === 'duckduckgo') return await duckduckgoSearch(query, maxResults, options, signal, timeoutMs)
 	throw new Error(`Unknown general-web backend "${backend}".`)
 }
@@ -1111,6 +1478,51 @@ async function searchFree(request, options, signal, log) {
 		xNote = `X search was unavailable (${brief}); these are general web results, not X posts.`
 	}
 
+	// Specialised sources the query is routed to run beside the general chain, each under a short timeout.
+	const routes = verticalsOf(query).filter((route) => options.backends.includes(route.backend)).filter((route) => {
+		const cooling = activeCooldown(cooldownKey(route.backend, options))
+		if (cooling !== undefined) attempts.push(`${labelOf(route.backend)} is skipped for ${formatSpan(cooling.until - Date.now())} (${cooling.brief})`)
+		return cooling === undefined
+	})
+	const verticalTimeoutMs = Math.min(options.timeoutMs, VERTICAL_TIMEOUT_MS, remaining())
+	const verticalSlots = routes.map(() => undefined)
+	const verticalRun = routes.length === 0 || verticalTimeoutMs < Math.min(MIN_REQUEST_MS, options.timeoutMs)
+		? undefined
+		: Promise.all(routes.map(async (route, index) => {
+			try {
+				verticalSlots[index] = { value: await searchVertical(route, VERTICAL_LIMIT, signal, verticalTimeoutMs) }
+			} catch (error) {
+				verticalSlots[index] = { error }
+				// A rate limit must pause the source even when its answer arrives after the grace period.
+				if (error instanceof BackendError && typeof error.cooldownMs === 'number') {
+					cooldowns.set(cooldownKey(route.backend, options), { until: Date.now() + error.cooldownMs, brief: error.brief })
+				}
+			}
+		}))
+	/**
+	 * The specialised sources that answered within `graceMs` (all of them when
+	 * it is omitted): `{ backend, sources }`, in route order. A source still
+	 * running after the grace period is left out, not waited for.
+	 */
+	const collectVerticals = async (graceMs) => {
+		if (verticalRun === undefined) return []
+		if (graceMs === undefined) await verticalRun
+		else {
+			let timer
+			await Promise.race([verticalRun, new Promise((resolve) => { timer = setTimeout(resolve, graceMs) })])
+			clearTimeout(timer)
+		}
+		if (signal?.aborted === true) throw abortReason(signal)
+		const answered = []
+		for (let index = 0; index < routes.length; index += 1) {
+			const slot = verticalSlots[index]
+			if (slot === undefined) attempts.push(`${labelOf(routes[index].backend)} was still answering and was left out`)
+			else if (slot.error !== undefined) recordFailure(routes[index].backend, options, slot.error, attempts)
+			else if (slot.value.sources.length > 0) answered.push({ backend: routes[index].backend, sources: slot.value.sources })
+		}
+		return answered
+	}
+
 	// The keyless floor starts with the first general failure, so a fallback costs the slowest request, not the sum.
 	let floor
 	const startFloor = () => {
@@ -1140,7 +1552,12 @@ async function searchFree(request, options, signal, log) {
 			const result = await searchGeneral(backend, query, maxResults, options, signal, timeoutMs)
 			if (result.sources.length > 0 || result.content !== undefined) {
 				const content = [xNote, result.content].filter((part) => part !== undefined).join(' ')
-				return finish({ ...(content.length === 0 ? {} : { content }), sources: result.sources }, options.cacheTtlMs)
+				// Routed specialised results lead the answer; the general results fill the rest of the page.
+				const special = dedupeByUrl(interleave((await collectVerticals(VERTICAL_GRACE_MS)).map((entry) => entry.sources))).slice(0, VERTICAL_SLOTS)
+				const sources = special.length === 0
+					? result.sources
+					: [...special, ...result.sources.slice(0, Math.max(maxResults - special.length, 1))]
+				return finish({ ...(content.length === 0 ? {} : { content }), sources }, options.cacheTtlMs)
 			}
 			attempts.push(`${labelOf(backend)} returned no results`)
 			briefs.push(`${labelOf(backend)} had no results`)
@@ -1153,14 +1570,21 @@ async function searchFree(request, options, signal, log) {
 
 	startFloor()
 	const groups = []
+	const contributors = []
+	for (const entry of await collectVerticals()) {
+		groups.push(entry.sources)
+		if (!contributors.includes(entry.backend)) contributors.push(entry.backend)
+	}
 	if (floor !== undefined) {
 		const settled = await floor
 		if (signal?.aborted === true) throw abortReason(signal)
 		for (let index = 0; index < settled.length; index += 1) {
 			const outcome = settled[index]
 			if (outcome.status === 'fulfilled') {
-				if (outcome.value.sources.length > 0) groups.push(outcome.value.sources)
-				else attempts.push(`${labelOf(keyless[index])} returned no results`)
+				if (outcome.value.sources.length > 0) {
+					groups.push(outcome.value.sources)
+					contributors.push(keyless[index])
+				} else attempts.push(`${labelOf(keyless[index])} returned no results`)
 			} else {
 				recordFailure(keyless[index], options, outcome.reason, attempts)
 			}
@@ -1174,7 +1598,7 @@ async function searchFree(request, options, signal, log) {
 			? ` A free Tavily API key (${options.tavilyApiKeyEnv}) restores full web results.`
 			: ''
 		const note = tried
-			? `General web search was unavailable (${[...new Set(briefs)].join(', ')}); these results come only from ${keyless.map(labelOf).join(' and ')}.${keyHint}`
+			? `General web search was unavailable (${[...new Set(briefs)].join(', ')}); these results come only from ${listOf(contributors.map(labelOf))}.${keyHint}`
 			: undefined
 		const content = [xNote === undefined ? undefined : xNote.replace('these are general web results, not X posts', 'these are not X posts'), note]
 			.filter((part) => part !== undefined).join(' ')
@@ -1201,8 +1625,8 @@ class FreeSearchProvider {
 		this.id = PROVIDER_ID
 		this.title = 'Free web search'
 		this.description = {
-			en: 'Web search that needs no paid API: Tavily (keyless, or a free API key for reliable results), optional Brave Search and SearXNG, and Wikipedia plus Hacker News when nothing else answers. Searches X posts through Grok Build when it is installed.',
-			zh: '无需付费 API 的网页搜索：Tavily（免密钥，或使用免费 API 密钥获得稳定结果）、可选的 Brave Search 与 SearXNG，以及在其他来源均不可用时的维基百科和 Hacker News。安装了 Grok Build 时可通过它搜索 X 帖子。',
+			en: 'Web search that needs no paid API: Tavily (keyless, or a free API key for reliable results), optional Brave Search and SearXNG, keyless Exa and You.com as backups, and Wikipedia plus Hacker News when nothing else answers. Error messages are also looked up on Stack Overflow and repository queries on GitHub. Searches X posts through Grok Build when it is installed.',
+			zh: '无需付费 API 的网页搜索：Tavily（免密钥，或使用免费 API 密钥获得稳定结果）、可选的 Brave Search 与 SearXNG、作为备用的免密钥 Exa 与 You.com，以及在其他来源均不可用时的维基百科和 Hacker News。报错信息还会在 Stack Overflow 上查找，仓库类查询会在 GitHub 上查找。安装了 Grok Build 时可通过它搜索 X 帖子。',
 		}
 	}
 
@@ -1259,7 +1683,9 @@ async function buildConfig() {
 
 /**
  * Plugin-row configuration schema (every field optional):
- *   backends: order to try — default 'x', 'tavily', 'brave', 'searxng', 'wikipedia', 'hackernews'; 'duckduckgo' is opt-in
+ *   backends: what to use, general backends in the order to try — default 'x', 'tavily', 'brave',
+ *     'searxng', 'exa', 'you', 'stackexchange', 'github', 'wikipedia', 'hackernews';
+ *     'arxiv' and 'duckduckgo' are opt-in
  *   tavilyApiKey: literal Tavily key (prefer the credential reference)
  *   tavilyApiKeyEnv: credential reference holding the key (default TAVILY_API_KEY)
  *   braveApiKey: literal Brave key (prefer the credential reference)

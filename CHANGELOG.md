@@ -12,6 +12,17 @@ Reliability release, from an end-to-end review of 0.1.1 inside DeepSeek Harness.
 
 ### Added
 
+- **Keyless backups: Exa and You.com.** New general backends `exa` and `you`
+  call the vendors' hosted keyless endpoints (no account). They sit after
+  Tavily, Brave and SearXNG in the default chain, so a spent Tavily keyless
+  allowance still leaves real web results instead of Wikipedia and Hacker News.
+- **Specialised sources with query routing.** A query that quotes an error
+  message (or names Stack Overflow) is also looked up on Stack Overflow, and a
+  query that names GitHub or asks for a repository is also sent to GitHub
+  repository search (`stackexchange`, `github`, both on by default). Up to
+  three of their results lead the answer, marked with their source type. They
+  never delay an answer by more than 1.5 s. `arxiv` exists as an opt-in.
+
 - **X search through Grok Build.** A query that targets X (`site:x.com`,
   `site:twitter.com`, "tweets about …", "on X") is answered by the `grok` CLI's
   X search when Grok Build is installed and signed in. Grok runs headless,

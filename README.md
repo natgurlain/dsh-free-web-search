@@ -9,6 +9,13 @@ so the built-in `web_search` tool works without paying for a search API.
 
 - **General web first:** Tavily answers out of the box in its keyless mode, and
   reliably once you add a free Tavily API key (1,000 credits/month, no card).
+- **Keyless backups:** when Tavily's keyless allowance is spent, Exa and
+  You.com answer through their hosted keyless endpoints, so the model still
+  gets real web results without any account.
+- **Specialised sources for the right queries:** a query that quotes an error
+  message is also looked up on Stack Overflow, and a query that names GitHub or
+  asks for a repository is also sent to GitHub repository search. Their top
+  results lead the answer, marked with their source type.
 - **Free upgrades:** Brave Search API ($5 of free credits per month) and a
   self-hosted SearXNG instance slot into the same chain when configured.
 - **X posts through Grok Build:** a query that targets X (`site:x.com`,
@@ -58,14 +65,23 @@ no credit card) and store it as `TAVILY_API_KEY` — in DeepSeek Harness's
 credential settings, or as an environment variable. The plugin reads the
 harness credential store first, so no restart is needed.
 
-Without a key the plugin still works; once the daily cap is hit, results come
-from Wikipedia and Hacker News only, and the tool result says so in one line.
+Without a key the plugin still works: once Tavily's daily cap is hit, Exa and
+You.com answer keyless. Their limits are small or unpublished, so the free
+Tavily key remains the dependable setup. Only when all three are unavailable do
+results come from Wikipedia and Hacker News, and the tool result then says so
+in one line.
 
 ## Backends
 
-The provider tries backends in configuration order and returns the first
-non-empty general-web answer. Keyless domain sources are merged and interleaved
-only when no general-web backend answers.
+There are three kinds of backend:
+
+- **General web** (`tavily`, `brave`, `searxng`, `exa`, `you`, `duckduckgo`):
+  tried in configuration order; the first non-empty answer wins.
+- **Specialised** (`stackexchange`, `github`, `arxiv`): asked only for queries
+  routed to them (see [Specialised sources](#specialised-sources)), beside the
+  general chain.
+- **Keyless floor** (`wikipedia`, `hackernews`): merged and interleaved only
+  when no general-web backend answers.
 
 | Backend id    | Service                     | Credential | Cost / limits |
 | ------------- | --------------------------- | ---------- | ------------- |
@@ -73,6 +89,11 @@ only when no general-web backend answers.
 | `tavily`      | Tavily Search (`api.tavily.com/search`) | none — keyless access mode; free key (`TAVILY_API_KEY`) recommended | keyless is capped at about ten searches a day; a free key gives 1,000 credits/month with no card |
 | `brave`       | Brave Search API (`/res/v1/web/search`) | `BRAVE_SEARCH_API_KEY` or `braveApiKey` | no free plan; each plan includes $5/month free credits ≈ 1,000 queries; a card is required to activate |
 | `searxng`     | A SearXNG instance with JSON enabled | `searxngBaseURL` | free and keyless when self-hosted; public instances usually disable JSON; can include the DuckDuckGo engine |
+| `exa`         | Exa hosted MCP endpoint (`mcp.exa.ai/mcp`, tool `web_search_exa`) | none — keyless | free rate limit, number unpublished; keyless needs a direct IPv4 connection (IPv6 or a proxy gets `403`) |
+| `you`         | You.com hosted MCP endpoint, free profile (`api.you.com/mcp?profile=free`, tool `you-search`) | none — keyless | 100 searches a day, no account |
+| `stackexchange` | Stack Exchange API, Stack Overflow questions with at least one answer | none | specialised; keyless quota is 300 requests a day per address |
+| `github`      | GitHub REST API, repository search | none | specialised; unauthenticated search allows 10 requests a minute per address |
+| `arxiv`       | arXiv Atom API | none | specialised, **opt-in**: multi-word queries were slow or rate-limited when tested on 2026-11-18 |
 | `duckduckgo`  | DuckDuckGo consumer HTML endpoint (`html.duckduckgo.com/html/`) | none | **opt-in, not in the default chain**; not an official API, no key exists for it, and plain HTTP clients usually get a CAPTCHA; see below |
 | `wikipedia`   | Wikipedia Action API        | none       | keyless, encyclopedic results only |
 | `hackernews`  | Hacker News (Algolia)       | none       | keyless, tech/community results only |
@@ -80,7 +101,8 @@ only when no general-web backend answers.
 ## Default behavior
 
 - `tavily` answers first. `brave` and `searxng` are skipped until their key or
-  base URL is configured. `duckduckgo` is not tried unless you add it.
+  base URL is configured. `exa` and then `you` answer when the backends before
+  them fail. `duckduckgo` and `arxiv` are not used unless you add them.
 - As soon as one general backend fails, `wikipedia` and `hackernews` start in
   the background. Their results are used only when no general backend answers,
   and the tool result then opens with one sentence naming what failed, for
@@ -123,6 +145,32 @@ in `~/.local/bin`, `~/.grok/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`
 (a desktop app does not inherit your shell's `PATH`); set `grokPath` if it
 lives elsewhere. Remove `x` from `backends` to turn the feature off.
 
+## Specialised sources
+
+General engines are weak at two things a coding agent asks for all the time, so
+two free APIs are asked as well when the query calls for them:
+
+| Query | Also asked | What comes back |
+| ----- | ---------- | --------------- |
+| quotes an error (`TypeError: …`, `ECONNREFUSED`, `Traceback`, "is not a function") or names Stack Overflow | `stackexchange` | answered Stack Overflow questions with score, answer count and tags |
+| names GitHub, or asks for a repository or an open-source library/tool | `github` | repositories with stars, language and last push |
+| names arXiv, preprints or research papers (only with `arxiv` enabled) | `arxiv` | papers with authors and abstract |
+
+- Routing is deliberately narrow: a query that names no source and quotes no
+  error asks none of them, and costs nothing extra.
+- Up to three specialised results lead the answer; the general results fill
+  the rest of the page. Each specialised snippet starts with its source type,
+  for example `Stack Overflow question · answered · score 12 · 3 answers`.
+- They run beside the general chain under a 5 s timeout. A source still
+  answering 1.5 s after the general answer is ready is left out, so it cannot
+  slow a search down.
+- When no general backend answers, their results join the fallback and the
+  note names them.
+- Package registries are not included: the npm and crates.io search APIs
+  ranked worse than the general engines for descriptive queries when tested.
+
+To turn one off, remove its id from `backends`.
+
 ## DuckDuckGo is opt-in (read before enabling it)
 
 DuckDuckGo has **no official API that returns web results**. Its only documented
@@ -160,7 +208,7 @@ masked. To set them by hand, override the plugin row in the profile's
 - id: free-web-search
   name: '@natgurlain/dsh-free-web-search'
   config:
-    backends: ['x', 'tavily', 'brave', 'searxng', 'wikipedia', 'hackernews']
+    backends: ['x', 'tavily', 'brave', 'searxng', 'exa', 'you', 'stackexchange', 'github', 'wikipedia', 'hackernews']
     tavilyApiKeyEnv: TAVILY_API_KEY
     braveApiKeyEnv: BRAVE_SEARCH_API_KEY
     searxngBaseURL: http://127.0.0.1:8888
@@ -172,7 +220,7 @@ masked. To set them by hand, override the plugin row in the profile's
 
 | Field | Default | Meaning |
 | ----- | ------- | ------- |
-| `backends` | all seven, in the order above | Which backends to use and in what order |
+| `backends` | the ten in the example above | Which backends to use; general backends are tried in this order |
 | `tavilyApiKeyEnv` | `TAVILY_API_KEY` | Credential reference holding the Tavily key |
 | `tavilyApiKey` | (unset) | Literal Tavily key; prefer the reference so no secret enters configuration |
 | `braveApiKeyEnv` | `BRAVE_SEARCH_API_KEY` | Credential reference holding the Brave key |
@@ -240,8 +288,9 @@ shipped anonymous HTTP fetch provider, whose id is `http`.
 - **User agent.** All requests send a descriptive `User-Agent` identifying the
   plugin; the DuckDuckGo backend sends a browser User-Agent instead because
   the endpoint answers anything else with a CAPTCHA.
-- **Not included:** You.com/Exa remote MCP backends (they speak MCP rather than
-  plain REST and can be mounted through DSH's MCP client).
+- **Exa and You.com are called keyless only.** Each search is one stateless
+  `tools/call` request to their hosted MCP endpoint. To use your own Exa or
+  You.com plan, mount their MCP server through DSH's MCP client.
 
 ## Development
 

@@ -286,3 +286,145 @@ test('a slow X search times out and the general chain still answers', { skip: pr
 		rmSync(folder, { recursive: true, force: true })
 	}
 })
+
+/** An MCP tool answer as the hosted endpoints send it: one event-stream message. */
+function mcp(text, extra = {}) {
+	return new Response(`event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }], ...extra } })}\n\n`, {
+		status: 200, headers: { 'content-type': 'text/event-stream' },
+	})
+}
+const tavilyCapped = () => json({ detail: { error: 'daily cap reached' } }, 429)
+const exaText = 'Title: First page\nURL: https://example.com/one\nPublished: 2026-09-28T09:00:00.000Z\nAuthor: N/A\nHighlights:\nFirst   highlight\ntext.\n\nTitle: Second page\nURL: https://example.com/two\nPublished: N/A\nAuthor: N/A\nHighlights:\nSecond highlight.\n'
+
+test('Exa answers keyless when Tavily keyless is capped, with no fallback note', async () => {
+	route({ 'api.tavily.com': tavilyCapped, 'mcp.exa.ai': () => mcp(exaText) })
+	const result = await load().search({ query: 'plain question', maxResults: 5 })
+	assert.deepEqual(result.sources.map((source) => source.url), ['https://example.com/one', 'https://example.com/two'])
+	assert.equal(result.sources[0].title, 'First page')
+	assert.equal(result.sources[0].snippet, 'First highlight text.')
+	assert.equal(result.sources[0].publishedAt, '2026-09-28T09:00:00.000Z')
+	assert.equal(result.sources[1].publishedAt, undefined)
+	assert.equal(result.content, undefined)
+	const request = JSON.parse(calls.find((call) => call.host === 'mcp.exa.ai').init.body)
+	assert.equal(request.method, 'tools/call')
+	assert.equal(request.params.name, 'web_search_exa')
+	assert.equal(request.params.arguments.query, 'plain question')
+	assert.ok(request.params.arguments.objective.length > 0)
+	assert.equal(countOf('api.you.com'), 0)
+})
+
+test('You.com answers when Exa is rate-limited, and Exa is then skipped', async () => {
+	const you = { results: { web: [{ url: 'https://example.com/y', title: 'You result', description: 'Described', page_age: '2026-09-28T09:00:00' }], news: [] } }
+	route({
+		'api.tavily.com': tavilyCapped,
+		'mcp.exa.ai': () => new Response('slow down', { status: 429 }),
+		'api.you.com': () => mcp(JSON.stringify(you)),
+	})
+	const provider = load({ cacheTtlSeconds: 0 })
+	const result = await provider.search({ query: 'plain question' })
+	assert.deepEqual(result.sources, [{ url: 'https://example.com/y', title: 'You result', snippet: 'Described', publishedAt: '2026-09-28T09:00:00' }])
+	assert.match(calls.find((call) => call.host === 'api.you.com').url, /profile=free/u)
+	await provider.search({ query: 'another question' })
+	assert.equal(countOf('mcp.exa.ai'), 1)
+	assert.equal(countOf('api.you.com'), 2)
+})
+
+test('an MCP tool error is a backend failure, not an empty answer', async () => {
+	route({
+		'mcp.exa.ai': () => mcp('Rate limit exceeded for the free tier', { isError: true }),
+		'en.wikipedia.org': wikipedia,
+	})
+	const result = await load({ backends: ['exa', 'wikipedia'] }).search({ query: 'plain question' })
+	assert.match(result.content, /^General web search was unavailable \(Exa rate-limited\); these results come only from Wikipedia\./u)
+})
+
+test('verticalsOf routes error messages and named sources only', () => {
+	assert.deepEqual(plugin.verticalsOf('best hiking trails in the Tatra mountains'), [])
+	assert.deepEqual(plugin.verticalsOf('how to write a paper airplane'), [])
+	assert.deepEqual(plugin.verticalsOf("TypeError: x is not a function react"), [{ backend: 'stackexchange', query: 'TypeError: x is not a function react' }])
+	assert.deepEqual(plugin.verticalsOf('ECONNREFUSED 127.0.0.1:5432'), [{ backend: 'stackexchange', query: 'ECONNREFUSED 127.0.0.1:5432' }])
+	assert.deepEqual(plugin.verticalsOf('open source vector database github'), [{ backend: 'github', query: 'vector database' }])
+	assert.deepEqual(plugin.verticalsOf('arxiv papers on diffusion models'), [{ backend: 'arxiv', query: 'diffusion models' }])
+	assert.deepEqual(plugin.verticalsOf('git rebase on stack overflow').map((entry) => entry.backend), ['stackexchange'])
+})
+
+const stackoverflow = () => json({
+	items: [
+		{ title: 'Why &quot;x&quot; fails', link: 'https://stackoverflow.com/q/1', score: 12, is_answered: true, answer_count: 3, creation_date: 1700000000, tags: ['node.js'] },
+		{ title: 'Downvoted', link: 'https://stackoverflow.com/q/2', score: -2, is_answered: false, answer_count: 1, creation_date: 1700000000, tags: [] },
+	],
+	quota_remaining: 250,
+})
+
+test('an error query puts answered Stack Overflow questions ahead of the general results', async () => {
+	route({
+		'api.tavily.com': () => json({ results: [1, 2, 3, 4].map((n) => ({ url: `https://example.com/${n}`, title: `T${n}`, content: 'c' })) }),
+		'api.stackexchange.com': stackoverflow,
+	})
+	const result = await load().search({ query: 'TypeError: x is not a function', maxResults: 4 })
+	assert.deepEqual(result.sources.map((source) => source.url), ['https://stackoverflow.com/q/1', 'https://example.com/1', 'https://example.com/2', 'https://example.com/3'])
+	assert.equal(result.sources[0].title, 'Why "x" fails')
+	assert.equal(result.sources[0].snippet, 'Stack Overflow question · answered · score 12 · 3 answers · tags: node.js')
+	assert.equal(result.sources[0].publishedAt, '2023-11-14T22:13:20.000Z')
+	const asked = new URL(calls.find((call) => call.host === 'api.stackexchange.com').url)
+	assert.equal(asked.searchParams.get('site'), 'stackoverflow')
+	assert.equal(asked.searchParams.get('answers'), '1')
+})
+
+test('an unrouted query asks no specialised source', async () => {
+	route({ 'api.tavily.com': () => json({ results: [{ url: 'https://example.com/1', title: 'T', content: 'c' }] }) })
+	await load().search({ query: 'best hiking trails' })
+	assert.deepEqual(calls.map((call) => call.host), ['api.tavily.com'])
+})
+
+test('a slow specialised source is left out instead of delaying the answer', async () => {
+	route({
+		'api.tavily.com': () => json({ results: [{ url: 'https://example.com/1', title: 'T', content: 'c' }] }),
+		'api.stackexchange.com': hang,
+	})
+	const started = Date.now()
+	const result = await load().search({ query: 'TypeError: x is not a function' })
+	assert.ok(Date.now() - started < 2500, `took ${Date.now() - started} ms`)
+	assert.deepEqual(result.sources.map((source) => source.url), ['https://example.com/1'])
+})
+
+test('GitHub repositories carry stars and language, and a spent rate limit pauses GitHub', async () => {
+	let limited = false
+	route({
+		'api.tavily.com': () => json({ results: [{ url: 'https://example.com/1', title: 'T', content: 'c' }] }),
+		'api.github.com': () => limited
+			? json({ message: 'API rate limit exceeded' }, 403, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + 600) })
+			: json({ items: [{ full_name: 'acme/vectordb', html_url: 'https://github.com/acme/vectordb', description: 'A vector database', stargazers_count: 1234, language: 'Rust', pushed_at: '2026-11-01T00:00:00Z' }] }),
+	})
+	const provider = load({ cacheTtlSeconds: 0 })
+	const result = await provider.search({ query: 'vector database github' })
+	assert.deepEqual(result.sources[0], { url: 'https://github.com/acme/vectordb', title: 'acme/vectordb', snippet: 'GitHub repository · 1234 stars · Rust — A vector database', publishedAt: '2026-11-01T00:00:00Z' })
+	assert.equal(new URL(calls.find((call) => call.host === 'api.github.com').url).searchParams.get('q'), 'vector database')
+	limited = true
+	await provider.search({ query: 'graph database github' })
+	await provider.search({ query: 'time series database github' })
+	assert.equal(countOf('api.github.com'), 2)
+})
+
+test('specialised results join the fallback and are named in its note', async () => {
+	route({ 'api.tavily.com': tavilyCapped, 'api.stackexchange.com': stackoverflow, 'en.wikipedia.org': wikipedia })
+	const result = await load({ backends: ['tavily', 'stackexchange', 'wikipedia'] }).search({ query: 'TypeError: x is not a function' })
+	assert.match(result.content, /these results come only from Stack Overflow and Wikipedia\./u)
+	assert.equal(result.sources.length, 2)
+})
+
+test('arXiv is opt-in and its Atom feed is parsed', async () => {
+	const atom = `<?xml version="1.0"?><feed><title>query</title><entry><id>http://arxiv.org/abs/2405.07437v2</id><published>2024-05-13T02:33:25Z</published><title>Evaluation of
+  RAG: A Survey</title><summary>  We survey &amp; compare.
+</summary><author><name>A One</name></author><author><name>B Two</name></author></entry></feed>`
+	route({
+		'api.tavily.com': () => json({ results: [{ url: 'https://example.com/1', title: 'T', content: 'c' }] }),
+		'export.arxiv.org': () => new Response(atom, { status: 200 }),
+	})
+	await load().search({ query: 'arxiv papers on rag evaluation' })
+	assert.equal(countOf('export.arxiv.org'), 0)
+	plugin.resetState()
+	const result = await load({ backends: ['tavily', 'arxiv'] }).search({ query: 'arxiv papers on rag evaluation' })
+	assert.deepEqual(result.sources[0], { url: 'https://arxiv.org/abs/2405.07437v2', title: 'Evaluation of RAG: A Survey', snippet: 'arXiv paper · A One, B Two — We survey & compare.', publishedAt: '2024-05-13T02:33:25Z' })
+	assert.equal(new URL(calls.find((call) => call.host === 'export.arxiv.org').url).searchParams.get('search_query'), 'all:rag AND all:evaluation')
+})
