@@ -73,14 +73,14 @@ only when no general-web backend answers.
 | `tavily`      | Tavily Search (`api.tavily.com/search`) | none — keyless access mode; free key (`TAVILY_API_KEY`) recommended | keyless is capped at about ten searches a day; a free key gives 1,000 credits/month with no card |
 | `brave`       | Brave Search API (`/res/v1/web/search`) | `BRAVE_SEARCH_API_KEY` or `braveApiKey` | no free plan; each plan includes $5/month free credits ≈ 1,000 queries; a card is required to activate |
 | `searxng`     | A SearXNG instance with JSON enabled | `searxngBaseURL` | free and keyless when self-hosted; public instances usually disable JSON; can include the DuckDuckGo engine |
-| `duckduckgo`  | DuckDuckGo consumer HTML endpoint (`html.duckduckgo.com/html/`) | none | best-effort fallback; **not an official API**, automated access is not authorized and is often answered with a CAPTCHA; see below |
+| `duckduckgo`  | DuckDuckGo consumer HTML endpoint (`html.duckduckgo.com/html/`) | none | **opt-in, not in the default chain**; not an official API, no key exists for it, and plain HTTP clients usually get a CAPTCHA; see below |
 | `wikipedia`   | Wikipedia Action API        | none       | keyless, encyclopedic results only |
 | `hackernews`  | Hacker News (Algolia)       | none       | keyless, tech/community results only |
 
 ## Default behavior
 
 - `tavily` answers first. `brave` and `searxng` are skipped until their key or
-  base URL is configured; `duckduckgo` is the last general-web attempt.
+  base URL is configured. `duckduckgo` is not tried unless you add it.
 - As soon as one general backend fails, `wikipedia` and `hackernews` start in
   the background. Their results are used only when no general backend answers,
   and the tool result then opens with one sentence naming what failed, for
@@ -123,7 +123,7 @@ in `~/.local/bin`, `~/.grok/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`
 (a desktop app does not inherit your shell's `PATH`); set `grokPath` if it
 lives elsewhere. Remove `x` from `backends` to turn the feature off.
 
-## DuckDuckGo caveat (read before relying on it)
+## DuckDuckGo is opt-in (read before enabling it)
 
 DuckDuckGo has **no official API that returns web results**. Its only documented
 machine endpoint is the deprecated Instant Answer API, which returns entity
@@ -132,19 +132,21 @@ search API: DuckDuckGo's acceptable-use policy does not authorize automated
 access, and the service responds to many automated clients with an HTTP 202
 "anomaly" CAPTCHA page.
 
-The `duckduckgo` backend is in the default chain anyway, as the last
-general-web attempt, because it works from some networks. It is fragile: which
-clients get the CAPTCHA changes over time and by network (on 2026-11-11 Node's
-`fetch` got results where `curl` did not; on 2026-11-17 it was the reverse).
-Consequences:
+There is also **no API key** that unlocks it: DuckDuckGo sells no search API,
+and the scrapers that still get through do so by imitating a browser's TLS
+fingerprint with native libraries, which a zero-dependency plugin cannot do.
 
-- The backend stays **after** the sanctioned backends in the default order.
+For that reason the `duckduckgo` backend is **not in the default chain** since
+0.2.0. It still works from some networks (on 2026-11-11 Node's `fetch` got
+results where `curl` did not; on 2026-11-17 it was the reverse), so it remains
+available:
+
+- To try it, add `"duckduckgo"` to `backends`, after the sanctioned backends.
+  You are responsible for how the endpoint is used.
 - A CAPTCHA is reported as an error and the backend is paused for 15 minutes,
   so a blocked network pays for one failed request, not one per search.
 - If you need a compliant, stable DuckDuckGo-backed path, run **SearXNG with
   its DuckDuckGo engine enabled** and use the `searxng` backend.
-- To keep the plugin to sanctioned APIs only, remove `"duckduckgo"` from
-  `backends`. You are responsible for how the endpoint is used.
 
 ## Configuration
 
@@ -158,7 +160,7 @@ masked. To set them by hand, override the plugin row in the profile's
 - id: free-web-search
   name: '@natgurlain/dsh-free-web-search'
   config:
-    backends: ['x', 'tavily', 'brave', 'searxng', 'duckduckgo', 'wikipedia', 'hackernews']
+    backends: ['x', 'tavily', 'brave', 'searxng', 'wikipedia', 'hackernews']
     tavilyApiKeyEnv: TAVILY_API_KEY
     braveApiKeyEnv: BRAVE_SEARCH_API_KEY
     searxngBaseURL: http://127.0.0.1:8888

@@ -9,11 +9,11 @@
  *   2. Brave Search API — no free plan, but every plan includes $5 of monthly
  *      free credits (≈1,000 queries) and needs an API key plus a card;
  *   3. a SearXNG instance that serves JSON (self-hosted; free and keyless);
- *   4. DuckDuckGo's consumer HTML endpoint as a best-effort fallback. It is not
- *      an official API, automated access is not authorized, and the endpoint
- *      often answers with an anti-bot challenge; it is tried after the
- *      sanctioned backends, reports the challenge instead of pretending it has
- *      no results, and is then skipped for a while;
+ *   4. (opt-in, not in the default chain) DuckDuckGo's consumer HTML endpoint.
+ *      It is not an official API, there is no key that unlocks it, automated
+ *      access is not authorized, and it answers plain HTTP clients with an
+ *      anti-bot challenge; when enabled it reports the challenge instead of
+ *      pretending it has no results, and is then skipped for a while;
  *   5. keyless Wikipedia (Action API) and Hacker News (Algolia) as a
  *      vendor-independent floor that needs no credentials at all.
  *
@@ -60,11 +60,10 @@ const USER_AGENT = `deepseek-harness-free-web-search/${VERSION}`
 /**
  * Browser User-Agent for the DuckDuckGo HTML endpoint only: it answers a
  * descriptive automation User-Agent with a CAPTCHA every time. The backend is
- * in the default chain as the last general-web attempt; remove `duckduckgo`
- * from `backends` to keep the plugin to sanctioned APIs.
+ * opt-in: add `duckduckgo` to `backends` to try it.
  */
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-const DEFAULT_BACKENDS = ['x', 'tavily', 'brave', 'searxng', 'duckduckgo', 'wikipedia', 'hackernews']
+const DEFAULT_BACKENDS = ['x', 'tavily', 'brave', 'searxng', 'wikipedia', 'hackernews']
 const GENERAL_BACKENDS = new Set(['tavily', 'brave', 'searxng', 'duckduckgo'])
 const KEYLESS_BACKENDS = new Set(['wikipedia', 'hackernews'])
 const KNOWN_BACKENDS = new Set(['x', ...GENERAL_BACKENDS, ...KEYLESS_BACKENDS])
@@ -1202,8 +1201,8 @@ class FreeSearchProvider {
 		this.id = PROVIDER_ID
 		this.title = 'Free web search'
 		this.description = {
-			en: 'Web search that needs no paid API: Tavily (keyless, or a free API key for reliable results), optional Brave Search and SearXNG, DuckDuckGo as a best-effort fallback, and Wikipedia plus Hacker News when nothing else answers. Searches X posts through Grok Build when it is installed.',
-			zh: '无需付费 API 的网页搜索：Tavily（免密钥，或使用免费 API 密钥获得稳定结果）、可选的 Brave Search 与 SearXNG、尽力而为的 DuckDuckGo 备用方案，以及在其他来源均不可用时的维基百科和 Hacker News。安装了 Grok Build 时可通过它搜索 X 帖子。',
+			en: 'Web search that needs no paid API: Tavily (keyless, or a free API key for reliable results), optional Brave Search and SearXNG, and Wikipedia plus Hacker News when nothing else answers. Searches X posts through Grok Build when it is installed.',
+			zh: '无需付费 API 的网页搜索：Tavily（免密钥，或使用免费 API 密钥获得稳定结果）、可选的 Brave Search 与 SearXNG，以及在其他来源均不可用时的维基百科和 Hacker News。安装了 Grok Build 时可通过它搜索 X 帖子。',
 		}
 	}
 
@@ -1260,7 +1259,7 @@ async function buildConfig() {
 
 /**
  * Plugin-row configuration schema (every field optional):
- *   backends: order to try — 'x', 'tavily', 'brave', 'searxng', 'duckduckgo', 'wikipedia', 'hackernews'
+ *   backends: order to try — default 'x', 'tavily', 'brave', 'searxng', 'wikipedia', 'hackernews'; 'duckduckgo' is opt-in
  *   tavilyApiKey: literal Tavily key (prefer the credential reference)
  *   tavilyApiKeyEnv: credential reference holding the key (default TAVILY_API_KEY)
  *   braveApiKey: literal Brave key (prefer the credential reference)

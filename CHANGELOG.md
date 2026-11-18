@@ -4,6 +4,12 @@
 
 Reliability release, from an end-to-end review of 0.1.1 inside DeepSeek Harness.
 
+### Changed
+
+- **DuckDuckGo is opt-in.** It is no longer in the default backend chain:
+  there is no official API or key for it, and its HTML endpoint answers plain
+  HTTP clients with a CAPTCHA. Add `"duckduckgo"` to `backends` to try it.
+
 ### Added
 
 - **X search through Grok Build.** A query that targets X (`site:x.com`,
