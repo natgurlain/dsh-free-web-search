@@ -1,9 +1,14 @@
 name: Release
 
-# Pushing a tag `vX.Y.Z` tests the code, publishes it to npm, and creates the
+# Pushing a tag `vX.Y.Z` tests the code, stages it on npm, and creates the
 # GitHub release. npm is reached by trusted publishing (OpenID Connect): the
 # package on npmjs.com names this repository and this workflow file as its
 # trusted publisher, so no npm token is stored anywhere.
+#
+# The trusted publisher holds the "npm stage publish" permission only, so the
+# version is staged, not public: a maintainer approves it with two-factor
+# authentication (on npmjs.com, or `npm stage list` and `npm stage approve
+# <stage-id>`), and only then can it be installed.
 on:
   push:
     tags: ['v*.*.*']
@@ -29,9 +34,13 @@ jobs:
             exit 1
           fi
       - run: npm test
-      # Trusted publishing needs npm 11.5.1 or later.
+      # Trusted publishing and staging need a recent npm.
       - run: npm install --global npm@latest
-      - run: npm publish --access public
+      - name: The package manifest needs no correction by npm
+        run: |
+          npm publish --dry-run 2>&1 | tee publish-check.log
+          ! grep -q "auto-corrected" publish-check.log
+      - run: npm stage publish --access public
       - name: Create the GitHub release from the changelog
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 — 2026-11-19
+
+First published version of the 0.3 line; 0.3.0 was tagged but never reached
+npm.
+
+### Fixed
+
+- The `dsh-free-web-search` command was dropped from the published package:
+  npm rejects a `bin` path that starts with `./`.
+- The release workflow stages the version on npm (`npm stage publish`) for a
+  maintainer to approve, which is what the trusted publisher permits.
+
 ## 0.3.0 — 2026-11-19
 
 ### Added

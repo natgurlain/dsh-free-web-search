@@ -23,5 +23,8 @@ jobs:
           node-version: ${{ matrix.node }}
       # The plugin has no dependencies; the tests mock the network and Grok Build.
       - run: npm test
-      - name: The package contains what it should
-        run: npm pack --dry-run
+      - name: The package contains what it should, and npm accepts its manifest as written
+        run: |
+          npm install --global npm@latest
+          npm publish --dry-run 2>&1 | tee publish-check.log
+          ! grep -q "auto-corrected" publish-check.log

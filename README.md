@@ -375,8 +375,10 @@ There is no build step and nothing to install; the package ships plain ESM.
 
 - Release: set the version in `package.json`, add its section to
   `CHANGELOG.md`, then push a tag `vX.Y.Z`. The release workflow tests the
-  code, publishes to npm through trusted publishing, and creates the GitHub
-  release.
+  code, stages the version on npm through trusted publishing, and creates the
+  GitHub release. A staged version is not public until a maintainer approves
+  it with two-factor authentication, on npmjs.com or with `npm stage list`
+  and `npm stage approve <stage-id>`.
 
 - Run one live search with Node:
 
