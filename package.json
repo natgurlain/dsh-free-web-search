@@ -1,6 +1,6 @@
 {
   "name": "@natgurlain/dsh-free-web-search",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Free web-search provider for DeepSeek Harness (ctx.web): Tavily keyless/free key, Brave Search API, SearXNG, X posts through Grok Build, and keyless Wikipedia/Hacker News fallbacks.",
   "type": "module",
   "main": "./index.js",

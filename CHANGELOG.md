@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.1 — 2026-11-19
+
+### Fixed
+
+- **X search no longer times out just before Grok answers.** A real Grok X
+  search takes 10–25 s, but 0.2.0 stopped it after 19 s to keep time for the
+  web search that followed. The web search now starts beside a still-running
+  X search six seconds before the deadline (or at once when X fails), so X
+  keeps the whole budget: `xTimeoutMs` defaults to 27 s and `totalTimeoutMs`
+  to 28 s, still below the web tool's 30 s. An X answer that arrives first
+  cancels the web search; a fast X answer never starts it.
+- **Shorter X answers.** One X search asks for at most six posts of 280
+  characters each; the length of Grok's answer is most of its run time.
+- **`maxResults` is honoured with specialised sources.** A routed query with a
+  small `maxResults` returned up to three extra results.
+
 ## 0.2.0 — 2026-11-17
 
 Reliability release, from an end-to-end review of 0.1.1 inside DeepSeek Harness.

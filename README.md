@@ -85,7 +85,7 @@ There are three kinds of backend:
 
 | Backend id    | Service                     | Credential | Cost / limits |
 | ------------- | --------------------------- | ---------- | ------------- |
-| `x`           | X posts through Grok Build (`grok` CLI) | a signed-in Grok Build install | only used for X-targeted queries; uses your Grok plan; about 10 s per search |
+| `x`           | X posts through Grok Build (`grok` CLI) | a signed-in Grok Build install | only used for X-targeted queries; uses your Grok plan; 10–25 s per search |
 | `tavily`      | Tavily Search (`api.tavily.com/search`) | none — keyless access mode; free key (`TAVILY_API_KEY`) recommended | keyless is capped at about ten searches a day; a free key gives 1,000 credits/month with no card |
 | `brave`       | Brave Search API (`/res/v1/web/search`) | `BRAVE_SEARCH_API_KEY` or `braveApiKey` | no free plan; each plan includes $5/month free credits ≈ 1,000 queries; a card is required to activate |
 | `searxng`     | A SearXNG instance with JSON enabled | `searxngBaseURL` | free and keyless when self-hosted; public instances usually disable JSON; can include the DuckDuckGo engine |
@@ -116,7 +116,7 @@ There are three kinds of backend:
   (`cacheTtlSeconds`); a fallback-only answer for one minute. The cache lives
   in memory and is gone when the plugin reloads.
 - **Time budget:** each request gets at most `timeoutMs` (8 s), and one whole
-  search at most `totalTimeoutMs` (25 s) — below the web tool's own
+  search at most `totalTimeoutMs` (28 s) — below the web tool's own
   `searchTimeoutMs` (30 s), so a stalled backend cannot get the tool call
   killed before the fallback answers.
 - **Cancellation:** the caller's abort signal reaches every request and the
@@ -139,6 +139,10 @@ API. If [Grok Build](https://x.ai/cli) is installed and signed in
   model's memory are discarded rather than cited.
 - If Grok is missing, signed out, slow, or finds nothing, the normal chain
   answers and the result says the posts are general web results, not X posts.
+- A Grok X search takes 10–25 s, so X gets nearly the whole time budget
+  (`xTimeoutMs`, 27 s). The web search starts beside it six seconds before
+  the deadline, or at once when X fails, so its results are ready if X does
+  not answer in time. One X search returns at most six posts.
 
 The search uses your Grok account and plan. `grok` is looked up on `PATH`, then
 in `~/.local/bin`, `~/.grok/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`
@@ -214,7 +218,7 @@ masked. To set them by hand, override the plugin row in the profile's
     searxngBaseURL: http://127.0.0.1:8888
     wikipediaLanguage: en
     timeoutMs: 8000
-    totalTimeoutMs: 25000
+    totalTimeoutMs: 28000
     cacheTtlSeconds: 300
 ```
 
@@ -228,11 +232,11 @@ masked. To set them by hand, override the plugin row in the profile's
 | `searxngBaseURL` | (unset) | Base URL of a SearXNG instance with JSON enabled |
 | `wikipediaLanguage` | `en` | Wikipedia language edition |
 | `timeoutMs` | `8000` | Upper bound for one request |
-| `totalTimeoutMs` | `25000` | Upper bound for one whole search; keep it below the web tool's `searchTimeoutMs` |
+| `totalTimeoutMs` | `28000` | Upper bound for one whole search; keep it below the web tool's `searchTimeoutMs` |
 | `cacheTtlSeconds` | `300` | How long an answer is reused for the same query; `0` disables the cache |
 | `grokPath` | (found automatically) | Path of the Grok Build CLI |
 | `grokModel` | (Grok Build's default) | Grok model used for X searches |
-| `xTimeoutMs` | `20000` | Upper bound for one X search |
+| `xTimeoutMs` | `27000` | Upper bound for one X search; the whole search still ends within `totalTimeoutMs` |
 
 Keys are resolved for every search: first the literal value, then the harness
 credential store (which also covers environment variables and `.env` files),

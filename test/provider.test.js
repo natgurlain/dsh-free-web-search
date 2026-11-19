@@ -287,6 +287,45 @@ test('a slow X search times out and the general chain still answers', { skip: pr
 	}
 })
 
+test('a slow X search keeps its time: the web search starts beside it and is cancelled when posts arrive', { skip: process.platform === 'win32' }, async () => {
+	route({ 'api.tavily.com': hang })
+	const folder = mkdtempSync(join(tmpdir(), 'fake-grok-'))
+	const file = join(folder, 'grok')
+	const events = [
+		{ type: 'tool_call_update', status: 'completed', rawOutput: { name: 'x_keyword_search' } },
+		{ type: 'text', data: JSON.stringify(posts) },
+		{ type: 'end', stopReason: 'end_turn' },
+	]
+	// Answers 1.5 s in: later than the moment the web search takes over (7 s budget, 6 s reserve).
+	writeFileSync(file, `#!/usr/bin/env node\nsetTimeout(() => { for (const event of ${JSON.stringify(events)}) console.log(JSON.stringify(event)) }, 1500)\n`)
+	chmodSync(file, 0o755)
+	try {
+		const result = await load({ grokPath: file, backends: ['x', 'tavily'], totalTimeoutMs: 7000 }).search({ query: 'tweets about rust' })
+		assert.deepEqual(result.sources.map((source) => source.url), ['https://x.com/alice/status/123'])
+		assert.equal(result.content, undefined)
+		assert.equal(countOf('api.tavily.com'), 1)
+		assert.equal(calls[0].init.signal.aborted, true)
+	} finally {
+		rmSync(folder, { recursive: true, force: true })
+	}
+})
+
+test('a fast X answer never starts the web search', { skip: process.platform === 'win32' }, async () => {
+	route({})
+	const grok = fakeGrok([
+		{ type: 'tool_call_update', status: 'completed', rawOutput: { name: 'x_keyword_search' } },
+		{ type: 'text', data: JSON.stringify(posts) },
+		{ type: 'end', stopReason: 'end_turn' },
+	])
+	try {
+		await load({ grokPath: grok.file, backends: ['x', 'tavily'] }).search({ query: 'tweets about rust' })
+		await new Promise((resolve) => { setTimeout(resolve, 50) })
+		assert.equal(calls.length, 0)
+	} finally {
+		grok.remove()
+	}
+})
+
 /** An MCP tool answer as the hosted endpoints send it: one event-stream message. */
 function mcp(text, extra = {}) {
 	return new Response(`event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }], ...extra } })}\n\n`, {
@@ -369,6 +408,15 @@ test('an error query puts answered Stack Overflow questions ahead of the general
 	const asked = new URL(calls.find((call) => call.host === 'api.stackexchange.com').url)
 	assert.equal(asked.searchParams.get('site'), 'stackoverflow')
 	assert.equal(asked.searchParams.get('answers'), '1')
+})
+
+test('specialised results never push the answer past maxResults', async () => {
+	route({
+		'api.tavily.com': () => json({ results: [1, 2].map((n) => ({ url: `https://example.com/${n}`, title: `T${n}`, content: 'c' })) }),
+		'api.stackexchange.com': stackoverflow,
+	})
+	const result = await load().search({ query: 'TypeError: x is not a function', maxResults: 1 })
+	assert.deepEqual(result.sources.map((source) => source.url), ['https://stackoverflow.com/q/1'])
 })
 
 test('an unrouted query asks no specialised source', async () => {
