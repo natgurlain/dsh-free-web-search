@@ -119,6 +119,9 @@ There are three kinds of backend:
   search at most `totalTimeoutMs` (28 s) — below the web tool's own
   `searchTimeoutMs` (30 s), so a stalled backend cannot get the tool call
   killed before the fallback answers.
+- **Slow networks:** when `fetch` cannot connect in Node's 250 ms per address
+  although the host is reachable, the plugin switches to a connection path
+  that allows two seconds per address, for the rest of the session.
 - **Cancellation:** the caller's abort signal reaches every request and the
   Grok process, so Stop and tool timeouts interrupt a search immediately.
 

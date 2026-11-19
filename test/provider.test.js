@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
+import { gzipSync } from 'node:zlib'
 
 import * as plugin from '../index.js'
 
@@ -484,4 +486,40 @@ test('arXiv is opt-in and its Atom feed is parsed', async () => {
 	const result = await load({ backends: ['tavily', 'arxiv'] }).search({ query: 'arxiv papers on rag evaluation' })
 	assert.deepEqual(result.sources[0], { url: 'https://arxiv.org/abs/2405.07437v2', title: 'Evaluation of RAG: A Survey', snippet: 'arXiv paper · A One, B Two — We survey & compare.', publishedAt: '2024-05-13T02:33:25Z' })
 	assert.equal(new URL(calls.find((call) => call.host === 'export.arxiv.org').url).searchParams.get('search_query'), 'all:rag AND all:evaluation')
+})
+
+test('a connection timeout in fetch switches to the slow-network path, which later requests use directly', async () => {
+	let served = 0
+	const server = createServer((request, response) => {
+		served += 1
+		assert.equal(request.headers.accept, 'application/json')
+		response.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip' })
+		response.end(gzipSync(JSON.stringify({ results: [{ url: `https://example.com/${served}`, title: 'T', content: 'c' }] })))
+	})
+	await new Promise((resolve) => { server.listen(0, '127.0.0.1', resolve) })
+	const base = `http://127.0.0.1:${server.address().port}`
+	globalThis.fetch = async (url) => {
+		calls.push({ host: new URL(String(url)).host })
+		const cause = new AggregateError([Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' })])
+		cause.code = 'ETIMEDOUT'
+		throw new TypeError('fetch failed', { cause })
+	}
+	try {
+		const provider = load({ backends: ['searxng'], searxngBaseURL: base })
+		const first = await provider.search({ query: 'first' })
+		assert.deepEqual(first.sources.map((source) => source.url), ['https://example.com/1'])
+		assert.equal(first.content, undefined)
+		const second = await provider.search({ query: 'second' })
+		assert.deepEqual(second.sources.map((source) => source.url), ['https://example.com/2'])
+		assert.equal(calls.length, 1)
+	} finally {
+		await new Promise((resolve) => { server.close(resolve) })
+	}
+})
+
+test('another fetch failure does not take the slow-network path', async () => {
+	globalThis.fetch = async () => {
+		throw new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }) })
+	}
+	await assert.rejects(load({ backends: ['searxng'], searxngBaseURL: 'http://127.0.0.1:9' }).search({ query: 'q' }), /DNS lookup failed/u)
 })

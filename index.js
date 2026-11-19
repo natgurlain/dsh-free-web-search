@@ -47,9 +47,12 @@
 
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import http from 'node:http'
+import https from 'node:https'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
+import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'free-web-search'
@@ -108,6 +111,8 @@ const X_MARGIN_MS = 500
 /** Most posts asked of one X search, and the length of each post's text: the answer's length sets the run time. */
 const X_MAX_POSTS = 6
 const X_TEXT_CHARS = 280
+/** Connection time per address once `fetch` has timed out connecting (Node's own default is 250 ms). */
+const SLOW_CONNECT_ATTEMPT_MS = 2000
 /** Upper bound for one specialised-source request, so it never holds back a general answer for long. */
 const VERTICAL_TIMEOUT_MS = 5000
 /** Results one specialised source is asked for, and how many of them lead a general answer. */
@@ -142,12 +147,15 @@ const cooldowns = new Map()
 /** Recent answers: `key -> { expires, result }`, oldest first. */
 const cache = new Map()
 let grokLookup = { at: 0, hint: undefined, path: undefined }
+/** Set once `fetch` could not connect in time although the network is up; requests then use `slowNetworkFetch`. */
+let slowConnect = false
 
 /** Forget cooldowns, cached answers, and the Grok lookup (tests). */
 export function resetState() {
 	cooldowns.clear()
 	cache.clear()
 	grokLookup = { at: 0, hint: undefined, path: undefined }
+	slowConnect = false
 }
 
 /**
@@ -353,6 +361,78 @@ function describeNetworkError(error, url, label) {
 }
 
 /**
+ * Whether `fetch` failed because no address of the host connected in time.
+ * Node gives each address 250 ms before it tries the next one, so on a slow
+ * network every attempt can time out although the host is reachable.
+ */
+function isConnectTimeout(error) {
+	const cause = error?.cause
+	return cause?.code === 'ETIMEDOUT' || (Array.isArray(cause?.errors) && cause.errors.some((entry) => entry?.code === 'ETIMEDOUT'))
+}
+
+/**
+ * `fetch` for slow networks: the same exchange through `node:http(s)`, which
+ * takes a longer per-address connection time. Follows redirects, decodes
+ * compressed bodies, and resolves to a buffered `Response`.
+ */
+function slowNetworkFetch(url, init, signal, redirects = 0) {
+	return new Promise((resolve, reject) => {
+		const fail = (error) => reject(error?.name === 'AbortError' ? error : new TypeError('fetch failed', { cause: error }))
+		let target
+		try {
+			target = new URL(String(url))
+		} catch (error) {
+			fail(error)
+			return
+		}
+		const request = (target.protocol === 'http:' ? http : https).request(target, {
+			method: init.method ?? 'GET',
+			headers: { ...init.headers },
+			signal,
+			autoSelectFamily: true,
+			autoSelectFamilyAttemptTimeout: SLOW_CONNECT_ATTEMPT_MS,
+		}, (response) => {
+			const status = response.statusCode ?? 0
+			const location = response.headers.location
+			if ([301, 302, 303, 307, 308].includes(status) && typeof location === 'string' && redirects < 3) {
+				response.resume()
+				const next = status === 303 || ((status === 301 || status === 302) && init.method === 'POST')
+					? { ...init, method: 'GET', body: undefined }
+					: init
+				slowNetworkFetch(new URL(location, target), next, signal, redirects + 1).then(resolve, reject)
+				return
+			}
+			const chunks = []
+			response.on('data', (chunk) => chunks.push(chunk))
+			response.on('error', fail)
+			response.on('end', () => {
+				try {
+					const raw = Buffer.concat(chunks)
+					const encoding = String(response.headers['content-encoding'] ?? '').toLowerCase()
+					const body = raw.length === 0
+						? raw
+						: encoding === 'gzip' || encoding === 'x-gzip'
+							? gunzipSync(raw)
+							: encoding === 'deflate'
+								? inflateSync(raw)
+								: encoding === 'br' ? brotliDecompressSync(raw) : raw
+					const headers = new Headers()
+					for (const [name, value] of Object.entries(response.headers)) {
+						if (name === 'content-encoding' || name === 'content-length' || value === undefined) continue
+						for (const item of Array.isArray(value) ? value : [value]) headers.append(name, item)
+					}
+					resolve(new Response([204, 205, 304].includes(status) ? null : body, { status, headers }))
+				} catch (error) {
+					fail(error)
+				}
+			})
+		})
+		request.on('error', fail)
+		request.end(init.body)
+	})
+}
+
+/**
  * Run one HTTP exchange — request and body read — under the caller's
  * cancellation signal and a timeout. A timeout becomes a descriptive error, a
  * caller abort is rethrown, and a network failure names its host and cause.
@@ -375,7 +455,18 @@ async function exchange(url, init, label, signal, timeoutMs, read) {
 	const onAbort = () => controller.abort()
 	if (signal !== undefined) signal.addEventListener('abort', onAbort, { once: true })
 	try {
-		const response = await fetch(url, { ...init, signal: controller.signal })
+		let response
+		if (slowConnect) response = await slowNetworkFetch(url, init, controller.signal)
+		else {
+			try {
+				response = await fetch(url, { ...init, signal: controller.signal })
+			} catch (error) {
+				if (controller.signal.aborted || !isConnectTimeout(error)) throw error
+				// From here on every request takes the slow-network path, so none repeats the doomed attempt.
+				slowConnect = true
+				response = await slowNetworkFetch(url, init, controller.signal)
+			}
+		}
 		return await read(response)
 	} catch (error) {
 		if (signal?.aborted === true) throw abortReason(signal)

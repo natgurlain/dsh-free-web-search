@@ -16,6 +16,10 @@
 - **`maxResults` is honoured with specialised sources.** A routed query with a
   small `maxResults` returned up to three extra results.
   The Wikipedia and Hacker News fallback now stops at `maxResults` too.
+- **Slow networks.** Node gives each address of a host 250 ms to connect, so
+  on a slow network `fetch` failed with `ETIMEDOUT` for hosts that `curl`
+  reached (seen with You.com). After the first such failure the plugin sends
+  its requests through `node:https` with two seconds per address.
 - **A query that only names a source** (`github`) is no longer sent to that
   source with nothing to look up.
 
