@@ -941,10 +941,9 @@ export function verticalsOf(query) {
 		if (!route.match(query)) continue
 		const stripped = route.strip === undefined ? query : query.replace(route.strip, ' ')
 		const cleaned = stripped.replace(/(?:^|\s)site:\S+/giu, ' ').replace(/\s+/gu, ' ').trim()
-		selected.push({
-			backend: route.backend,
-			query: cleaned.length >= 2 ? cleaned : query.trim(),
-		})
+		// A query that only names the source ("github") has nothing to look up there.
+		if (cleaned.length < 2) continue
+		selected.push({ backend: route.backend, query: cleaned })
 	}
 	return selected
 }
@@ -1577,7 +1576,7 @@ async function searchFree(request, options, signal, log) {
 			}
 		}
 
-		const merged = interleave(groups)
+		const merged = dedupeByUrl(interleave(groups)).slice(0, maxResults)
 		if (merged.length > 0) {
 			const tried = general.some((backend) => isConfigured(backend, options))
 			const keyHint = options.backends.includes('tavily') && options.tavilyApiKey.length === 0

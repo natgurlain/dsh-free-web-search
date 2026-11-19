@@ -15,6 +15,9 @@
   characters each; the length of Grok's answer is most of its run time.
 - **`maxResults` is honoured with specialised sources.** A routed query with a
   small `maxResults` returned up to three extra results.
+  The Wikipedia and Hacker News fallback now stops at `maxResults` too.
+- **A query that only names a source** (`github`) is no longer sent to that
+  source with nothing to look up.
 
 ## 0.2.0 — 2026-11-17
 

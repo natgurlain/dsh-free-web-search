@@ -419,6 +419,15 @@ test('specialised results never push the answer past maxResults', async () => {
 	assert.deepEqual(result.sources.map((source) => source.url), ['https://stackoverflow.com/q/1'])
 })
 
+test('a query that only names a source is not routed to it, and the fallback honours maxResults', async () => {
+	assert.deepEqual(plugin.verticalsOf('github'), [])
+	assert.deepEqual(plugin.verticalsOf('GitHub repo'), [])
+	route({ 'api.tavily.com': () => json({}, 429), 'en.wikipedia.org': wikipedia, 'hn.algolia.com': hackernews })
+	const result = await load({ backends: ['tavily', 'github', 'wikipedia', 'hackernews'] }).search({ query: 'github', maxResults: 1 })
+	assert.equal(result.sources.length, 1)
+	assert.equal(countOf('api.github.com'), 0)
+})
+
 test('an unrouted query asks no specialised source', async () => {
 	route({ 'api.tavily.com': () => json({ results: [{ url: 'https://example.com/1', title: 'T', content: 'c' }] }) })
 	await load().search({ query: 'best hiking trails' })
