@@ -3,6 +3,8 @@
 [![npm](https://img.shields.io/npm/v/%40natgurlain%2Fdsh-free-web-search?label=npm)](https://www.npmjs.com/package/@natgurlain/dsh-free-web-search)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
+![Terminal recording: an error query answered with Stack Overflow questions first, a query filtered by site and time, and a check of every source](./docs/demo.svg)
+
 A free web-search provider for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 web capability seam (`ctx.web`). It registers the search provider id **`free`**,
 so the built-in `web_search` tool works without paying for a search API.
@@ -16,6 +18,11 @@ so the built-in `web_search` tool works without paying for a search API.
   message is also looked up on Stack Overflow, and a query that names GitHub or
   asks for a repository is also sent to GitHub repository search. Their top
   results lead the answer, marked with their source type.
+- **Filters from the query:** `site:example.com`, `-site:example.com`, and a
+  recent window such as "past week" are passed to each backend, and results
+  that do not match are dropped.
+- **Fast on slow networks:** a backend that stays silent for three seconds no
+  longer holds the next one back; the first answer wins.
 - **Free upgrades:** Brave Search API ($5 of free credits per month) and a
   self-hosted SearXNG instance slot into the same chain when configured.
 - **X posts through Grok Build:** a query that targets X (`site:x.com`,
@@ -165,7 +172,7 @@ two free APIs are asked as well when the query calls for them:
 
 - Routing is deliberately narrow: a query that names no source and quotes no
   error asks none of them, and costs nothing extra.
-- Up to three specialised results lead the answer; the general results fill
+- Up to three specialised results, and at most half of those requested, lead the answer; the general results fill
   the rest of the page. Each specialised snippet starts with its source type,
   for example `Stack Overflow question · answered · score 12 · 3 answers`.
 - They run beside the general chain under a 5 s timeout. A source still
@@ -177,6 +184,49 @@ two free APIs are asked as well when the query calls for them:
   ranked worse than the general engines for descriptive queries when tested.
 
 To turn one off, remove its id from `backends`.
+
+## Filters in the query
+
+DeepSeek Harness passes a search provider only the query text and a result
+count, so filters are read from the query itself:
+
+| In the query | Effect |
+| ------------ | ------ |
+| `site:example.com` | only results from that site and its subdomains |
+| `-site:example.com` | no results from that site |
+| "past week", "in the last 30 days", "last 24 hours", "this month" | only results from that window (day, week, month, or year) |
+
+Each backend gets the filter in its own parameters (Tavily, Brave, SearXNG,
+You.com, DuckDuckGo) or as an instruction (Exa). Afterwards the plugin drops
+any result off the requested site, and any dated result older than the
+window; when nothing remains, the next backend is asked. Vague words such as
+"latest", "recent", or "today" set no window, and "last year" does not either
+(it names the previous calendar year, not the past twelve months). Wikipedia
+and Hacker News, the fallback sources, do not apply these filters.
+
+## Check your setup from a terminal
+
+The package includes a small command line that loads the same provider the
+harness loads:
+
+```bash
+npx @natgurlain/dsh-free-web-search doctor
+```
+
+It asks every backend one question from your machine and prints which ones
+answer, how fast, and why a failing one fails. Add `--x` to include an X
+search through Grok Build (up to 27 s) and `--all` for the opt-in backends.
+
+```bash
+npx @natgurlain/dsh-free-web-search search "TypeError: x is not a function"
+```
+
+runs one search as the agent would and prints the results; `--verbose` adds
+the diagnostics the plugin logs, `--json` prints the raw result. From a
+checkout, use `node cli.js` in place of the `npx` part. Keys are read from the
+environment (`TAVILY_API_KEY`, `BRAVE_SEARCH_API_KEY`), a SearXNG instance
+from `SEARXNG_BASE_URL`. The command cannot see the cooldowns of a running
+harness; it shows what is reachable from your machine right now.
 
 ## DuckDuckGo is opt-in (read before enabling it)
 
@@ -236,6 +286,7 @@ masked. To set them by hand, override the plugin row in the profile's
 | `wikipediaLanguage` | `en` | Wikipedia language edition |
 | `timeoutMs` | `8000` | Upper bound for one request |
 | `totalTimeoutMs` | `28000` | Upper bound for one whole search; keep it below the web tool's `searchTimeoutMs` |
+| `hedgeDelayMs` | `3000` | How long a general backend may stay silent before the next one starts beside it; `0` asks strictly one at a time |
 | `cacheTtlSeconds` | `300` | How long an answer is reused for the same query; `0` disables the cache |
 | `grokPath` | (found automatically) | Path of the Grok Build CLI |
 | `grokModel` | (Grok Build's default) | Grok model used for X searches |
@@ -308,6 +359,24 @@ There is no build step and nothing to install; the package ships plain ESM.
   ```bash
   npm test
   ```
+
+- Check every backend, or run one live search:
+
+  ```bash
+  node cli.js doctor
+  node cli.js search "your query" --verbose
+  ```
+
+- Regenerate the recording at the top of this page from real output:
+
+  ```bash
+  node scripts/make-demo.mjs
+  ```
+
+- Release: set the version in `package.json`, add its section to
+  `CHANGELOG.md`, then push a tag `vX.Y.Z`. The release workflow tests the
+  code, publishes to npm through trusted publishing, and creates the GitHub
+  release.
 
 - Run one live search with Node:
 

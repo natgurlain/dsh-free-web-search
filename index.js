@@ -95,6 +95,8 @@ const DEFAULT_BRAVE_ENV = 'BRAVE_SEARCH_API_KEY'
 const DEFAULT_TIMEOUT_MS = 8000
 const DEFAULT_TOTAL_TIMEOUT_MS = 28000
 const DEFAULT_X_TIMEOUT_MS = 27000
+/** How long a general backend may stay silent before the next one starts beside it; 0 asks strictly one at a time. */
+const DEFAULT_HEDGE_DELAY_MS = 3000
 const DEFAULT_CACHE_TTL_SECONDS = 300
 const DEFAULT_MAX_RESULTS = 8
 const SNIPPET_MAX_CHARS = 480
@@ -301,6 +303,7 @@ function readOptions(config) {
 		grokPath: nonEmpty(source.grokPath) ?? '',
 		grokModel: nonEmpty(source.grokModel) ?? '',
 		xTimeoutMs: positiveInt(source.xTimeoutMs) ?? DEFAULT_X_TIMEOUT_MS,
+		hedgeDelayMs: Math.min(nonNegativeInt(source.hedgeDelayMs) ?? DEFAULT_HEDGE_DELAY_MS, 60000),
 	}
 }
 
@@ -584,8 +587,77 @@ function dedupeByUrl(sources) {
 	return unique
 }
 
+/** A query with no filters. */
+const NO_FILTERS = { text: '', sites: [], excluded: [], range: undefined }
+/** Days each recency window covers, narrowest first. */
+const RANGE_DAYS = { day: 1, week: 7, month: 31, year: 366 }
+const UNIT_DAYS = { hour: 1 / 24, day: 1, week: 7, month: 31, year: 366 }
+const RECENT_WINDOW = /\b(?:(?:the\s+)?past|(?:in|over|within|from|during)\s+the\s+last)\s+(?:(\d{1,3})\s+)?(hour|day|week|month|year)s?\b|\blast\s+(\d{1,3})\s+(hour|day|week|month|year)s?\b/iu
+const THIS_WINDOW = /\bthis\s+(week|month|year)\b/iu
+
+/**
+ * The filters a query's own text asks for. The search request carries only a
+ * query, so `site:` / `-site:` operators and an explicit recent window ("past
+ * week", "in the last 30 days", "this month") are read from it and passed to
+ * each backend in its own parameters. `text` is the query without the
+ * operators; the time phrase stays in it. Vague words ("latest", "recent",
+ * "today") set no window.
+ *
+ * @returns `{ text, sites, excluded, range }`; `range` is `day`, `week`, `month`, `year`, or `undefined`.
+ */
+export function filtersOf(query) {
+	const sites = []
+	const excluded = []
+	const stripped = query.replace(/(^|\s)(-?)site:(\S+)/giu, (match, lead, minus, raw) => {
+		const domain = raw.toLowerCase().replace(/^https?:\/\//u, '').replace(/[/?#].*$/u, '').replace(/^www\./u, '')
+		if (!/^(?:[a-z0-9-]+\.)+[a-z]{2,}$/u.test(domain)) return match
+		const list = minus === '-' ? excluded : sites
+		if (!list.includes(domain)) list.push(domain)
+		return lead
+	}).replace(/\s+/gu, ' ').trim()
+	let range
+	const recent = RECENT_WINDOW.exec(query)
+	if (recent !== null) {
+		const days = Number(recent[1] ?? recent[3] ?? 1) * UNIT_DAYS[(recent[2] ?? recent[4]).toLowerCase()]
+		range = Object.keys(RANGE_DAYS).find((name) => days <= RANGE_DAYS[name])
+	} else {
+		const current = THIS_WINDOW.exec(query)
+		if (current !== null) range = current[1].toLowerCase()
+	}
+	return { text: stripped.length >= 2 ? stripped : query.trim(), sites, excluded, range }
+}
+
+/** Whether `url` is on `domain` or one of its subdomains. */
+function onDomain(url, domain) {
+	try {
+		const host = new URL(url).hostname.toLowerCase()
+		return host === domain || host.endsWith(`.${domain}`)
+	} catch {
+		return false
+	}
+}
+
+/**
+ * Keep the sources that satisfy the query's filters: on a requested site, off
+ * an excluded one, and — when a source is dated — inside the recent window.
+ * Backends apply the filters themselves; this holds those that do not.
+ */
+function applyFilters(sources, filters) {
+	if (filters.sites.length === 0 && filters.excluded.length === 0 && filters.range === undefined) return sources
+	const oldest = filters.range === undefined ? undefined : Date.now() - (RANGE_DAYS[filters.range] + 1) * 86400000
+	return sources.filter((source) => {
+		if (filters.sites.length > 0 && !filters.sites.some((domain) => onDomain(source.url, domain))) return false
+		if (filters.excluded.some((domain) => onDomain(source.url, domain))) return false
+		if (oldest !== undefined && source.publishedAt !== undefined) {
+			const at = Date.parse(source.publishedAt)
+			if (Number.isFinite(at) && at < oldest) return false
+		}
+		return true
+	})
+}
+
 /** Search through Tavily: keyless access mode unless a key is configured. */
-async function tavilySearch(query, maxResults, options, signal, timeoutMs) {
+async function tavilySearch(query, maxResults, options, signal, timeoutMs, filters = NO_FILTERS) {
 	const keyed = options.tavilyApiKey.length > 0
 	const headers = {
 		accept: 'application/json',
@@ -597,7 +669,13 @@ async function tavilySearch(query, maxResults, options, signal, timeoutMs) {
 		method: 'POST',
 		redirect: 'error',
 		headers,
-		body: JSON.stringify({ query, max_results: Math.min(Math.max(maxResults, 1), 20) }),
+		body: JSON.stringify({
+			query: filters.sites.length + filters.excluded.length > 0 ? filters.text : query,
+			max_results: Math.min(Math.max(maxResults, 1), 20),
+			...(filters.sites.length > 0 ? { include_domains: filters.sites } : {}),
+			...(filters.excluded.length > 0 ? { exclude_domains: filters.excluded } : {}),
+			...(filters.range === undefined ? {} : { time_range: filters.range }),
+		}),
 	}, 'Tavily', signal, timeoutMs, async (response) => {
 		if (response.status === 401 || response.status === 403) {
 			const detail = await errorDetail(response)
@@ -639,10 +717,11 @@ async function tavilySearch(query, maxResults, options, signal, timeoutMs) {
 }
 
 /** Search through the Brave Search API (free monthly credits need a key). */
-async function braveSearch(query, maxResults, options, signal, timeoutMs) {
+async function braveSearch(query, maxResults, options, signal, timeoutMs, filters = NO_FILTERS) {
 	const url = new URL(BRAVE_ENDPOINT)
 	url.searchParams.set('q', query)
 	url.searchParams.set('count', String(Math.min(Math.max(maxResults, 1), 20)))
+	if (filters.range !== undefined) url.searchParams.set('freshness', `p${filters.range[0]}`)
 	return await exchange(url, {
 		method: 'GET',
 		redirect: 'error',
@@ -681,10 +760,12 @@ async function braveSearch(query, maxResults, options, signal, timeoutMs) {
 }
 
 /** Search a SearXNG instance that has the JSON format enabled. */
-async function searxngSearch(query, maxResults, options, signal, timeoutMs) {
+async function searxngSearch(query, maxResults, options, signal, timeoutMs, filters = NO_FILTERS) {
 	const url = new URL(`${options.searxngBaseURL}/search`)
 	url.searchParams.set('q', query)
 	url.searchParams.set('format', 'json')
+	// SearXNG has no week window; the month window is the next wider one.
+	if (filters.range !== undefined) url.searchParams.set('time_range', filters.range === 'week' ? 'month' : filters.range)
 	return await exchange(url, {
 		method: 'GET',
 		redirect: 'error',
@@ -759,8 +840,8 @@ function parseDuckDuckGoHtml(html) {
  * challenge; the challenge is reported as an error and the backend is skipped
  * for a while, so a blocked network pays for it once, not on every search.
  */
-async function duckduckgoSearch(query, maxResults, options, signal, timeoutMs) {
-	const form = new URLSearchParams({ q: query, kl: 'wt-wt' })
+async function duckduckgoSearch(query, maxResults, options, signal, timeoutMs, filters = NO_FILTERS) {
+	const form = new URLSearchParams({ q: query, kl: 'wt-wt', ...(filters.range === undefined ? {} : { df: filters.range[0] }) })
 	return await exchange(DDG_ENDPOINT, {
 		method: 'POST',
 		redirect: 'error',
@@ -956,20 +1037,26 @@ function parseExaText(text) {
 }
 
 /** Search through Exa's hosted MCP endpoint (keyless; free rate limit, IPv4 only). */
-async function exaSearch(query, maxResults, options, signal, timeoutMs) {
+async function exaSearch(query, maxResults, options, signal, timeoutMs, filters = NO_FILTERS) {
 	const text = await mcpToolText(EXA_ENDPOINT, 'web_search_exa', {
-		query,
+		query: filters.text.length > 0 ? filters.text : query,
 		numResults: Math.min(Math.max(maxResults, 1), 10),
-		objective: `Find the pages that best answer this search query: ${clipText(query, 300)}`,
+		objective: [
+			`Find the pages that best answer this search query: ${clipText(query, 300)}`,
+			...(filters.sites.length > 0 ? [`Return only pages from: ${filters.sites.join(', ')}.`] : []),
+			...(filters.excluded.length > 0 ? [`Never return pages from: ${filters.excluded.join(', ')}.`] : []),
+			...(filters.range === undefined ? [] : [`Return only pages published within the last ${filters.range}.`]),
+		].join(' '),
 	}, 'Exa', signal, timeoutMs)
 	return { sources: parseExaText(text).slice(0, Math.max(maxResults, 1)) }
 }
 
 /** Search through You.com's hosted MCP endpoint, free profile (keyless; 100 searches a day). */
-async function youSearch(query, maxResults, options, signal, timeoutMs) {
+async function youSearch(query, maxResults, options, signal, timeoutMs, filters = NO_FILTERS) {
 	const text = await mcpToolText(YOU_ENDPOINT, 'you-search', {
 		query: query.length > 400 ? query.slice(0, 400) : query,
 		count: Math.min(Math.max(maxResults, 1), 20),
+		...(filters.range === undefined ? {} : { freshness: filters.range }),
 	}, 'You.com', signal, timeoutMs)
 	let body
 	try {
@@ -1434,13 +1521,13 @@ async function xSearch(query, maxResults, options, signal, timeoutMs, grokPath) 
 }
 
 /** Dispatch one general-web backend. */
-async function searchGeneral(backend, query, maxResults, options, signal, timeoutMs) {
-	if (backend === 'tavily') return await tavilySearch(query, maxResults, options, signal, timeoutMs)
-	if (backend === 'brave') return await braveSearch(query, maxResults, options, signal, timeoutMs)
-	if (backend === 'searxng') return await searxngSearch(query, maxResults, options, signal, timeoutMs)
-	if (backend === 'exa') return await exaSearch(query, maxResults, options, signal, timeoutMs)
-	if (backend === 'you') return await youSearch(query, maxResults, options, signal, timeoutMs)
-	if (backend === 'duckduckgo') return await duckduckgoSearch(query, maxResults, options, signal, timeoutMs)
+async function searchGeneral(backend, query, maxResults, options, signal, timeoutMs, filters) {
+	if (backend === 'tavily') return await tavilySearch(query, maxResults, options, signal, timeoutMs, filters)
+	if (backend === 'brave') return await braveSearch(query, maxResults, options, signal, timeoutMs, filters)
+	if (backend === 'searxng') return await searxngSearch(query, maxResults, options, signal, timeoutMs, filters)
+	if (backend === 'exa') return await exaSearch(query, maxResults, options, signal, timeoutMs, filters)
+	if (backend === 'you') return await youSearch(query, maxResults, options, signal, timeoutMs, filters)
+	if (backend === 'duckduckgo') return await duckduckgoSearch(query, maxResults, options, signal, timeoutMs, filters)
 	throw new Error(`Unknown general-web backend "${backend}".`)
 }
 
@@ -1610,38 +1697,73 @@ async function searchFree(request, options, signal, log) {
 			)
 		}
 
-		for (const backend of general) {
-			if (!isConfigured(backend, options)) continue
-			const cooling = activeCooldown(cooldownKey(backend, options))
-			if (cooling !== undefined) {
-				attempts.push(`${labelOf(backend)} is skipped for ${formatSpan(cooling.until - Date.now())} (${cooling.brief})`)
-				briefs.push(cooling.brief)
-				startFloor()
-				continue
-			}
-			const timeoutMs = Math.min(options.timeoutMs, remaining())
-			if (remaining() < MIN_REQUEST_MS) {
-				attempts.push(`${labelOf(backend)} was skipped: the time budget ran out`)
-				startFloor()
-				continue
-			}
-			try {
-				const result = await searchGeneral(backend, query, maxResults, options, webSignal, timeoutMs)
-				if (result.sources.length > 0 || result.content !== undefined) {
-					// Routed specialised results lead the answer; the general results fill the rest of the page.
-					const special = dedupeByUrl(interleave((await collectVerticals(VERTICAL_GRACE_MS)).map((entry) => entry.sources))).slice(0, Math.min(VERTICAL_SLOTS, maxResults))
-					const sources = special.length === 0
-						? result.sources
-						: [...special, ...result.sources.slice(0, maxResults - special.length)]
-					return { content: result.content, sources, ttlMs: options.cacheTtlMs, floor: false }
+		// The general chain, in order. A backend still silent after `hedgeDelayMs` no longer holds the
+		// next one back: the next starts beside it, the first answer wins, and the rest are cancelled.
+		const filters = filtersOf(query)
+		const running = new Map()
+		let cursor = 0
+		const launch = () => {
+			while (cursor < general.length) {
+				const backend = general[cursor]
+				cursor += 1
+				if (!isConfigured(backend, options)) continue
+				const cooling = activeCooldown(cooldownKey(backend, options))
+				if (cooling !== undefined) {
+					attempts.push(`${labelOf(backend)} is skipped for ${formatSpan(cooling.until - Date.now())} (${cooling.brief})`)
+					briefs.push(cooling.brief)
+					startFloor()
+					continue
 				}
+				if (remaining() < MIN_REQUEST_MS) {
+					attempts.push(`${labelOf(backend)} was skipped: the time budget ran out`)
+					startFloor()
+					continue
+				}
+				const cancel = new AbortController()
+				const own = AbortSignal.any([webSignal, cancel.signal])
+				running.set(backend, {
+					cancel,
+					done: searchGeneral(backend, query, maxResults, options, own, Math.min(options.timeoutMs, remaining()), filters)
+						.then((result) => ({ backend, result }), (error) => ({ backend, error })),
+				})
+				return true
+			}
+			return false
+		}
+		const hasNext = () => general.slice(cursor).some((backend) => isConfigured(backend, options))
+		launch()
+		while (running.size > 0) {
+			let timer
+			const waits = [...running.values()].map((entry) => entry.done)
+			if (options.hedgeDelayMs > 0 && hasNext()) {
+				waits.push(new Promise((resolve) => { timer = setTimeout(resolve, options.hedgeDelayMs) }))
+			}
+			const settled = await Promise.race(waits)
+			clearTimeout(timer)
+			if (webSignal.aborted) throw abortReason(webSignal)
+			if (settled === undefined) {
+				launch()
+				continue
+			}
+			const { backend, error } = settled
+			running.delete(backend)
+			const result = error !== undefined ? undefined : { ...settled.result, sources: applyFilters(settled.result.sources, filters) }
+			if (error !== undefined) {
+				briefs.push(recordFailure(backend, options, error, attempts))
+			} else if (result.sources.length > 0 || (result.content !== undefined && settled.result.sources.length === 0)) {
+				for (const entry of running.values()) entry.cancel.abort()
+				// Routed specialised results lead the answer, on at most half the page; the general results fill the rest.
+				const special = dedupeByUrl(interleave((await collectVerticals(VERTICAL_GRACE_MS)).map((entry) => entry.sources))).slice(0, Math.min(VERTICAL_SLOTS, Math.ceil(maxResults / 2)))
+				const sources = special.length === 0
+					? result.sources
+					: [...special, ...result.sources.slice(0, maxResults - special.length)]
+				return { content: result.content, sources, ttlMs: options.cacheTtlMs, floor: false }
+			} else {
 				attempts.push(`${labelOf(backend)} returned no results`)
 				briefs.push(`${labelOf(backend)} had no results`)
-			} catch (error) {
-				if (webSignal?.aborted === true) throw abortReason(webSignal)
-				briefs.push(recordFailure(backend, options, error, attempts))
 			}
 			startFloor()
+			if (running.size === 0) launch()
 		}
 
 		startFloor()
@@ -1801,6 +1923,7 @@ async function buildConfig() {
 			grokPath: z.string(),
 			grokModel: z.string(),
 			xTimeoutMs: z.number().step(1).min(1).default(DEFAULT_X_TIMEOUT_MS),
+			hedgeDelayMs: z.number().step(1).min(0).default(DEFAULT_HEDGE_DELAY_MS),
 		})
 	} catch {
 		return undefined
@@ -1825,6 +1948,8 @@ async function buildConfig() {
  *   grokPath: path of the Grok Build CLI (default: found on PATH)
  *   grokModel: Grok model for X searches (default: Grok Build's own default)
  *   xTimeoutMs: upper bound for one X search (default 27000)
+ *   hedgeDelayMs: how long a general backend may stay silent before the next
+ *     one starts beside it; the first answer wins (default 3000; 0 = one at a time)
  *
  * `undefined` when the harness's schemastery is not resolvable (plain Node).
  */

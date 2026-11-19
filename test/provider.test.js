@@ -523,3 +523,67 @@ test('another fetch failure does not take the slow-network path', async () => {
 	}
 	await assert.rejects(load({ backends: ['searxng'], searxngBaseURL: 'http://127.0.0.1:9' }).search({ query: 'q' }), /DNS lookup failed/u)
 })
+
+test('a silent backend no longer holds the next one back: the first answer wins and the slow one is cancelled, not paused', async () => {
+	route({ 'api.tavily.com': hang, 'mcp.exa.ai': () => mcp(exaText) })
+	const provider = load({ backends: ['tavily', 'exa', 'wikipedia'], hedgeDelayMs: 100, cacheTtlSeconds: 0 })
+	const started = Date.now()
+	const result = await provider.search({ query: 'plain question' })
+	assert.ok(Date.now() - started < 1000)
+	assert.deepEqual(result.sources.map((source) => source.url), ['https://example.com/one', 'https://example.com/two'])
+	assert.equal(result.content, undefined)
+	assert.equal(calls[0].init.signal.aborted, true)
+	await provider.search({ query: 'another question' })
+	assert.equal(countOf('api.tavily.com'), 2)
+	assert.equal(countOf('en.wikipedia.org'), 0)
+})
+
+test('a fast first backend never starts the next, and hedgeDelayMs 0 asks strictly one at a time', async () => {
+	route({ 'api.tavily.com': () => json({ results: [{ url: 'https://example.com/a' }] }) })
+	await load({ hedgeDelayMs: 1 }).search({ query: 'plain question' })
+	assert.deepEqual(calls.map((call) => call.host), ['api.tavily.com'])
+	calls = []
+	plugin.resetState()
+	route({ 'api.tavily.com': hang, 'mcp.exa.ai': () => mcp(exaText) })
+	const started = Date.now()
+	const result = await load({ backends: ['tavily', 'exa'], hedgeDelayMs: 0, timeoutMs: 300 }).search({ query: 'plain question' })
+	assert.ok(Date.now() - started >= 290)
+	assert.equal(result.sources.length, 2)
+})
+
+test('filtersOf reads site operators and explicit recent windows only', () => {
+	assert.deepEqual(plugin.filtersOf('rust news site:blog.rust-lang.org past week'), { text: 'rust news past week', sites: ['blog.rust-lang.org'], excluded: [], range: 'week' })
+	assert.deepEqual(plugin.filtersOf('recipes -site:https://www.pinterest.com/pins in the last 30 days'), { text: 'recipes in the last 30 days', sites: [], excluded: ['pinterest.com'], range: 'month' })
+	assert.equal(plugin.filtersOf('outage last 24 hours').range, 'day')
+	assert.equal(plugin.filtersOf('releases this year').range, 'year')
+	for (const vague of ['latest news today', 'what happened last year', 'recent rust releases', 'the last week of the war', 'site:nonsense']) {
+		assert.deepEqual(plugin.filtersOf(vague), { text: vague, sites: [], excluded: [], range: undefined })
+	}
+})
+
+test('a site and a recent window reach the backend as its own parameters', async () => {
+	route({ 'api.tavily.com': () => json({ results: [{ url: 'https://blog.rust-lang.org/a' }] }) })
+	await load().search({ query: 'release notes site:blog.rust-lang.org -site:reddit.com past month' })
+	assert.deepEqual(JSON.parse(calls[0].init.body), {
+		query: 'release notes past month', max_results: 8, include_domains: ['blog.rust-lang.org'], exclude_domains: ['reddit.com'], time_range: 'month',
+	})
+	calls = []
+	plugin.resetState()
+	route({ 'api.you.com': () => mcp(JSON.stringify({ results: { web: [{ url: 'https://example.com/y' }] } })) })
+	await load({ backends: ['you'] }).search({ query: 'chip export rules past week' })
+	assert.equal(JSON.parse(calls[0].init.body).params.arguments.freshness, 'week')
+})
+
+test('results off the requested site or older than the window are dropped, and the next backend is asked', async () => {
+	const old = 'Title: Old\nURL: https://example.com/old\nPublished: 2020-01-01T00:00:00.000Z\nAuthor: N/A\nHighlights:\nOld.\n'
+	route({
+		'mcp.exa.ai': (init) => mcp(JSON.parse(init.body).params.arguments.query.includes('week') ? old : exaText),
+		'api.you.com': () => mcp(JSON.stringify({ results: { web: [{ url: 'https://docs.example.org/page' }, { url: 'https://other.net/x' }] } })),
+	})
+	const provider = load({ backends: ['exa', 'you'] })
+	const sited = await provider.search({ query: 'setup guide site:example.org' })
+	assert.deepEqual(sited.sources.map((source) => source.url), ['https://docs.example.org/page'])
+	assert.match(JSON.parse(calls[0].init.body).params.arguments.objective, /Return only pages from: example\.org\./u)
+	const recent = await provider.search({ query: 'news past week' })
+	assert.deepEqual(recent.sources.map((source) => source.url), ['https://docs.example.org/page', 'https://other.net/x'])
+})

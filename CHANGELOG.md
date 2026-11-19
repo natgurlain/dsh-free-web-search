@@ -1,6 +1,30 @@
 # Changelog
 
-## 0.2.1 — 2026-11-19
+## 0.3.0 — 2026-11-19
+
+### Added
+
+- **Faster answers on slow networks.** A general backend that has not answered
+  after three seconds (`hedgeDelayMs`) no longer holds the next one back: the
+  next starts beside it, the first answer wins, and the slower request is
+  cancelled without pausing its backend. A backend that answers in time never
+  starts another, so no allowance is spent on fast networks.
+- **Filters read from the query.** `site:example.com`, `-site:example.com`,
+  and an explicit recent window ("past week", "in the last 30 days", "this
+  month") reach each backend as its own parameters (Tavily, Brave, SearXNG,
+  You.com, DuckDuckGo) or as an instruction (Exa). Results off the requested
+  site, or dated outside the window, are dropped, and the next backend is
+  asked when none remain.
+- **Command line.** `dsh-free-web-search doctor` checks every backend from
+  your machine and says which answer; `dsh-free-web-search search <query>`
+  runs one search as the agent would.
+- **Automated releases.** GitHub Actions run the tests on every push; pushing
+  a version tag publishes to npm and creates the GitHub release.
+
+### Changed
+
+- Specialised results take at most half of the requested results (and at most
+  three), so web results always appear beside them.
 
 ### Fixed
 
